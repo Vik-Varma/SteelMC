@@ -615,7 +615,7 @@ impl World {
 
     /// Returns the runtime entity manager.
     #[must_use]
-    pub(crate) const fn entity_manager(&self) -> &WorldEntityManager {
+    pub const fn entity_manager(&self) -> &WorldEntityManager {
         &self.entity_manager
     }
 }
