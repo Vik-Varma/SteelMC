@@ -379,7 +379,7 @@ impl Chunk {
     }
 
     /// Returns the generation heightmaps retained by this chunk.
-    pub(crate) fn generation_heightmaps(&self) -> RwLockReadGuard<'_, ChunkHeightmaps> {
+    pub fn generation_heightmaps(&self) -> RwLockReadGuard<'_, ChunkHeightmaps> {
         self.heightmaps.read()
     }
 
