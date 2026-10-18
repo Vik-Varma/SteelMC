@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::{cell::Cell, iter, marker::PhantomData, sync::Arc};
+use std::{cell::Cell, cmp::Reverse, iter, marker::PhantomData, sync::Arc};
 
 use glam::{DVec3, IVec3};
 use rustc_hash::FxHashSet;
@@ -443,6 +443,9 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         // Collect writes per (x,z) column and flush in batch to avoid per-block
         // write lock acquisition on sections.
         let mut pending_writes: Vec<(usize, usize, usize, BlockStateId)> = Vec::new();
+        // Fluids to mark for postprocessing as `(local_z, local_x, world_y)`. The fill runs
+        // cell by cell, so they are marked afterwards in Vanilla's `doFill` order instead.
+        let mut fluid_updates: Vec<(usize, usize, i32)> = Vec::new();
         let mut prev_x: usize = usize::MAX;
         let mut prev_z: usize = usize::MAX;
         let mut ocean_floor_wg =
@@ -519,9 +522,7 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                         ocean_floor_wg.update_for_initial_fill(local_x, world_y, local_z, id);
                         world_surface_wg.update_for_initial_fill(local_x, world_y, local_z, id);
                         if aquifer.should_schedule_fluid_update() && id.has_fluid() {
-                            chunk.mark_pos_for_postprocessing(BlockPos::new(
-                                world_x, world_y, world_z,
-                            ));
+                            fluid_updates.push((local_z, local_x, world_y));
                         }
                     }
                     AquiferResult::Air => {}
@@ -532,6 +533,18 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         // Flush remaining writes
         if !pending_writes.is_empty() {
             chunk.write_block_batch(&pending_writes);
+        }
+        // Vanilla's `doFill` visits z, then x, then y from the top down. Postprocessing
+        // runs in list order, so the order is observable through fluid tick scheduling.
+        fluid_updates.sort_unstable_by_key(|&(local_z, local_x, world_y)| {
+            (local_z, local_x, Reverse(world_y))
+        });
+        for (local_z, local_x, world_y) in fluid_updates {
+            chunk.mark_pos_for_postprocessing(BlockPos::new(
+                chunk_min_x + local_x as i32,
+                world_y,
+                chunk_min_z + local_z as i32,
+            ));
         }
         chunk.replace_noise_heightmaps(ocean_floor_wg, world_surface_wg);
         chunk.install_post_noise_state(N::wrap_post_noise_state(aquifer, material_ore_vein_values));
