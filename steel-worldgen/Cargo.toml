@@ -22,6 +22,10 @@ wincode.workspace = true
 rayon.workspace = true
 
 [build-dependencies]
+# Not used in code: orders the build so steel-utils' build script has downloaded
+# `steel-utils/build_assets/builtin_datapacks` before this build script reads it.
+steel-utils.workspace = true
+
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
