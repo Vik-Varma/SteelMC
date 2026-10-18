@@ -189,6 +189,92 @@ fn cancelled_generation_task_keeps_cached_holders_pinned_for_in_flight_steps() {
     stop_chunk_tasks(world);
 }
 
+/// Builds a center holder with every holder its task caches, schedules one task to
+/// `target_status`, and takes that task out of the pending queue as if it had started.
+fn started_generation_task(
+    world: &World,
+    target_status: ChunkStatus,
+) -> (Arc<ChunkHolder>, RunningGenerationTaskPermit) {
+    let cache_radius = GENERATION_PYRAMID
+        .get_step_to(target_status)
+        .accumulated_dependencies
+        .get_radius_of(ChunkStatus::Empty) as i32;
+    for z in -cache_radius..=cache_radius {
+        for x in -cache_radius..=cache_radius {
+            let pos = ChunkPos::new(x, z);
+            let holder = Arc::new(ChunkHolder::new(
+                pos,
+                ChunkTicketLevel::STRONGEST,
+                None,
+                world.chunk_map.world_gen_context.min_y(),
+                world.chunk_map.world_gen_context.height(),
+            ));
+            let _ = world.chunk_map.chunks.insert_sync(pos, holder);
+        }
+    }
+    let center = world
+        .chunk_map
+        .chunks
+        .read_sync(&ChunkPos::new(0, 0), |_, holder| Arc::clone(holder))
+        .expect("the center holder should be cached");
+    assert!(center.schedule_chunk_generation_task_b(target_status, &world.chunk_map));
+    let task = world
+        .chunk_map
+        .pending_generation_tasks
+        .lock()
+        .pop()
+        .expect("the center task should be pending");
+    world
+        .chunk_map
+        .running_generation_tasks
+        .fetch_add(1, Ordering::AcqRel);
+    let permit = RunningGenerationTaskPermit {
+        chunk_map: Arc::clone(&world.chunk_map),
+        task,
+    };
+    (center, permit)
+}
+
+#[test]
+fn generation_task_cancelled_by_a_failed_dependency_is_rescheduled() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("self_cancelled_generation_task");
+    let world = &world_fixture.world;
+    world.chunk_map.stop_generation_refill_loop();
+    let target_status = ChunkStatus::Biomes;
+    let (center, permit) = started_generation_task(world, target_status);
+
+    // A task cancels itself when a dependency's step fails; the holder keeps its level.
+    permit.task.cancel();
+    let cancelled = Arc::clone(&permit.task);
+    drop(permit);
+
+    let pending = world.chunk_map.pending_generation_tasks.lock();
+    assert_eq!(pending.len(), 1, "the center must get a new task");
+    assert!(!Arc::ptr_eq(&pending[0], &cancelled));
+    assert_eq!(pending[0].target_status, target_status);
+    assert!(Arc::ptr_eq(pending[0].center_holder(), &center));
+    drop(pending);
+
+    stop_chunk_tasks(world);
+}
+
+#[test]
+fn generation_task_cancelled_by_its_holder_is_not_rescheduled() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("holder_cancelled_generation_task");
+    let world = &world_fixture.world;
+    world.chunk_map.stop_generation_refill_loop();
+    let (center, permit) = started_generation_task(world, ChunkStatus::Biomes);
+
+    // Unloading or a level drop takes the task off the holder before cancelling it.
+    center.cancel_generation_task();
+    drop(permit);
+
+    assert!(world.chunk_map.pending_generation_tasks.lock().is_empty());
+    stop_chunk_tasks(world);
+}
+
 #[test]
 fn cached_holder_rechecks_publication_and_generation_permission() {
     init_vanilla_registry();

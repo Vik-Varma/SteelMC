@@ -306,9 +306,13 @@ struct RunningGenerationTaskPermit {
 
 impl Drop for RunningGenerationTaskPermit {
     fn drop(&mut self) {
-        self.task
-            .center_holder()
-            .clear_generation_task_if_current(&self.task);
+        let holder = self.task.center_holder();
+        if holder.clear_generation_task_if_current(&self.task) && self.task.is_cancelled() {
+            // The task cancelled itself because a dependency failed, e.g. a neighbour's
+            // claimed step was abandoned when that neighbour's level dropped. Neither the
+            // holder's level nor its task changed, so nothing else would schedule it again.
+            holder.schedule_chunk_generation_task_b(self.task.target_status, &self.chunk_map);
+        }
         self.chunk_map
             .running_generation_tasks
             .fetch_sub(1, Ordering::AcqRel);

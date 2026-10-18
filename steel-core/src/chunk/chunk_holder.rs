@@ -1382,7 +1382,8 @@ impl ChunkHolder {
     }
 
     /// Clears the current generation task if it is still the supplied task.
-    pub(crate) fn clear_generation_task_if_current(&self, task: &Arc<ChunkGenerationTask>) {
+    /// Returns whether it was.
+    pub(crate) fn clear_generation_task_if_current(&self, task: &Arc<ChunkGenerationTask>) -> bool {
         let mut task_guard = self.generation_task.lock();
         if task_guard
             .as_ref()
@@ -1391,7 +1392,9 @@ impl ChunkHolder {
             task_guard.take();
             self.generation_task_target
                 .store(STATUS_NONE, Ordering::Release);
+            return true;
         }
+        false
     }
 }
 
