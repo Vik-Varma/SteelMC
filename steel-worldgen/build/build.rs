@@ -6,6 +6,10 @@
 
 use std::{env, fs, io, path::Path, process::Command};
 
+// Only here so Cargo runs steel-utils' build script, which downloads the
+// `builtin_datapacks` this script reads, before this one.
+use steel_utils as _;
+
 mod density;
 mod multi_noise;
 mod noise_parameters;
