@@ -556,7 +556,7 @@ impl ChunkStorage {
         clippy::too_many_lines,
         reason = "chunk save preparation keeps related serialization setup in one pass"
     )]
-    pub(crate) fn prepare_chunk_save(
+    pub fn prepare_chunk_save(
         chunk: &Chunk,
         status: ChunkStatus,
         runtime_entities: &[SharedEntity],
