@@ -795,6 +795,14 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
                     chunk.write_column(local_x, local_z, &pending_writes);
                     for &(relative_y, state) in &pending_writes {
                         column_buf[relative_y] = state;
+                        // Vanilla's surface `BlockColumn.setBlock` marks every fluid it places.
+                        if state.has_fluid() {
+                            chunk.mark_pos_for_postprocessing(BlockPos::new(
+                                block_x,
+                                min_y + relative_y as i32,
+                                block_z,
+                            ));
+                        }
                     }
                 }
 
