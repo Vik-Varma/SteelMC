@@ -1833,9 +1833,15 @@ impl FullChunkRef<'_> {
         let data = Vec::new();
 
         let mut cursor = Cursor::new(data);
+        let encode_started = std::time::Instant::now();
         self.chunk.sections.sections.iter().for_each(|section| {
             section.read().write(&mut cursor);
         });
+        crate::chunk::encode_stats::record_sections(
+            self.chunk.sections.sections.len(),
+            cursor.get_ref().len(),
+            encode_started.elapsed(),
+        );
 
         let heightmaps = {
             let heightmaps = self.chunk.heightmaps.read();

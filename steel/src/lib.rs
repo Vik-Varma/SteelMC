@@ -138,6 +138,7 @@ impl SteelServer {
     /// Starts the server and begins accepting connections.
     pub async fn start(&mut self, task_tracker: TaskTracker) {
         log::info!("Started Steel Server");
+        steel_core::chunk::encode_stats::log_build_banner();
 
         let server = Arc::clone(&self.server);
         let token = self.cancel_token.clone();

@@ -15,6 +15,7 @@ pub mod chunk_ticket_manager;
 pub(crate) mod chunk_ticket_storage;
 mod chunk_tracker;
 mod data;
+pub mod encode_stats;
 /// Tracks Full-neighborhood readiness for ticking chunk lifecycles.
 pub(crate) mod full_chunk_readiness;
 pub(crate) mod gameplay_chunk_lookup_cache;
