@@ -277,6 +277,7 @@ impl ChunkSender {
                     let revision_before = holder.packet_content_revision();
                     let chunk = holder.try_full_chunk()?;
 
+                    let packet_started = std::time::Instant::now();
                     let packet = EncodedPacket::from_bare(
                         CLevelChunkWithLight {
                             x: pos.0.x,
@@ -288,6 +289,7 @@ impl ChunkSender {
                         ConnectionProtocol::Play,
                     )
                     .expect("Failed to encode chunk packet");
+                    crate::chunk::encode_stats::record_packet(packet_started.elapsed());
                     let revision_after = holder.packet_content_revision();
                     if revision_before != revision_after
                         || holder.ticking_readiness_snapshot() != prepared.readiness

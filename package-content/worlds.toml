@@ -3,7 +3,7 @@
 
 # Root defaults inherited by domains and worlds unless overridden.
 save_path = "saves"
-seed = ""
+seed = "20261019"
 default_gamemode = "survival"
 difficulty = "normal"
 
