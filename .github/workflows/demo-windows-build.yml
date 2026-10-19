@@ -1,0 +1,36 @@
+# Builds the local comparison demos (demo-baseline, demo-faster) the same way release.yml
+# builds steel-windows.exe, and uploads each as an artifact. Not part of any PR.
+name: Demo Windows build
+
+on:
+  push:
+    branches:
+      - demo-baseline
+      - demo-faster
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build portable release binary
+        run: cargo build --release --features stand-alone,deadlock_detection --verbose
+      - name: Name the executable after the demo
+        shell: bash
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            demo-baseline) name=steel-baseline.exe ;;
+            demo-faster) name=steel-faster-section-encoding.exe ;;
+            *) name="steel-${GITHUB_REF_NAME}.exe" ;;
+          esac
+          cp target/release/steel.exe "$name"
+          echo "EXE_NAME=$name" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.EXE_NAME }}
+          path: ${{ env.EXE_NAME }}
