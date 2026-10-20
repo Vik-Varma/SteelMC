@@ -7,7 +7,7 @@ use crossterm::{
 use std::{
     io::Write,
     sync::Arc,
-    time::{self, Instant},
+    time::{self, Instant, SystemTime},
 };
 use steel_utils::locks::AsyncRwLock;
 use steel_utils::logger::{Level, LogData, STEEL_LOGGER, SteelLogger};
@@ -37,6 +37,37 @@ fn terminal_height() -> usize {
 
 pub(crate) use state::LogState;
 
+/// When an entry was logged, captured before it is queued so a backed-up log loop
+/// doesn't shift its timestamp.
+#[derive(Clone, Copy)]
+struct LogTime {
+    instant: Instant,
+    wall: SystemTime,
+}
+
+impl LogTime {
+    fn now() -> Self {
+        Self {
+            instant: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
+
+    fn format(self, format: Option<LogTimeFormat>, start_time: Instant) -> String {
+        match format {
+            Some(LogTimeFormat::Date) => {
+                let time: chrono::DateTime<Utc> = self.wall.into();
+                format!("{} ", time.format("%T:%3f"))
+            }
+            Some(LogTimeFormat::Uptime) => {
+                let elapsed = self.instant.saturating_duration_since(start_time);
+                format!("{:>6.2}s ", elapsed.as_secs_f64())
+            }
+            _ => String::new(),
+        }
+    }
+}
+
 pub(crate) enum Move {
     None,
     Up,
@@ -46,7 +77,7 @@ pub(crate) enum Move {
 /// A logger implementation with commands suggestions
 pub struct CommandLogger {
     input: Arc<AsyncRwLock<LogState>>,
-    sender: mpsc::UnboundedSender<(Level, LogData)>,
+    sender: mpsc::UnboundedSender<(Level, LogData, LogTime)>,
     cancel_token: CancellationToken,
     stopped: CancellationToken,
     log_stopped: CancellationToken,
@@ -102,16 +133,19 @@ impl CommandLogger {
         }
     }
 
-    async fn log_loop(self: Arc<Self>, mut receiver: mpsc::UnboundedReceiver<(Level, LogData)>) {
+    async fn log_loop(
+        self: Arc<Self>,
+        mut receiver: mpsc::UnboundedReceiver<(Level, LogData, LogTime)>,
+    ) {
         loop {
             tokio::select! {
                 biased;
-                Some((lvl, data)) = receiver.recv() => {
-                    self.write_entry(lvl, data).await;
+                Some((lvl, data, at)) = receiver.recv() => {
+                    self.write_entry(lvl, data, at).await;
                 }
                 () = self.cancel_token.cancelled() => {
-                    while let Ok((lvl, data)) = receiver.try_recv() {
-                        self.write_entry(lvl, data).await;
+                    while let Ok((lvl, data, at)) = receiver.try_recv() {
+                        self.write_entry(lvl, data, at).await;
                     }
                     self.flush_file().await;
                     self.log_stopped.cancel();
@@ -121,14 +155,15 @@ impl CommandLogger {
         }
     }
 
-    async fn write_entry(&self, lvl: Level, data: LogData) {
-        let (lvl, data) = self.write_log_entry(lvl, data).await;
+    async fn write_entry(&self, lvl: Level, data: LogData, at: LogTime) {
+        let time_str = at.format(self.log_config.as_ref().map(|l| l.time), self.start_time);
+        let (lvl, data) = self.write_log_entry(lvl, data, &time_str).await;
         if self.log_config.as_ref().is_some_and(|l| l.log_file) {
-            self.write_file_entry(lvl, data).await;
+            self.write_file_entry(lvl, data, &time_str).await;
         }
     }
 
-    async fn write_log_entry(&self, lvl: Level, data: LogData) -> (Level, LogData) {
+    async fn write_log_entry(&self, lvl: Level, data: LogData, time_str: &str) -> (Level, LogData) {
         let mut input = self.input.write().await;
 
         if let Err(err) = input.out.cursor_to(0) {
@@ -136,7 +171,6 @@ impl CommandLogger {
             return (lvl, data);
         }
 
-        let time_str = self.format_time();
         let module_path_str = self.format_module_path(&data, true);
         let extra_str = self.format_extra(&data, true);
         let rendered = normalize_terminal_newlines(&format!(
@@ -166,10 +200,9 @@ impl CommandLogger {
         (lvl, data)
     }
 
-    async fn write_file_entry(&self, lvl: Level, data: LogData) {
+    async fn write_file_entry(&self, lvl: Level, data: LogData, time_str: &str) {
         let mut input = self.input.write().await;
 
-        let time_str = self.format_time();
         let module_path_str = self.format_module_path(&data, false);
         let extra_str = self.format_extra(&data, false);
 
@@ -187,20 +220,6 @@ impl CommandLogger {
         let mut input = self.input.write().await;
         if let Err(err) = input.file.flush() {
             eprintln!("Failed to flush log file: {err}");
-        }
-    }
-
-    fn format_time(&self) -> String {
-        match self.log_config.as_ref().map(|l| &l.time) {
-            Some(LogTimeFormat::Date) => {
-                let time: chrono::DateTime<Utc> = time::SystemTime::now().into();
-                format!("{} ", time.format("%T:%3f"))
-            }
-            Some(LogTimeFormat::Uptime) => {
-                let elapsed = self.start_time.elapsed();
-                format!("{:>6.2}s ", elapsed.as_secs_f64())
-            }
-            _ => String::new(),
         }
     }
 
@@ -260,7 +279,7 @@ fn normalize_terminal_newlines(rendered: &str) -> String {
 
 impl SteelLogger for CommandLogger {
     fn log(&self, lvl: Level, data: LogData) {
-        self.sender.send((lvl, data)).ok();
+        self.sender.send((lvl, data, LogTime::now())).ok();
     }
 }
 
@@ -287,7 +306,26 @@ impl<S: Subscriber> Layer<S> for LoggerLayer {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_terminal_newlines, rendered_terminal_rows};
+    use super::{LogTime, normalize_terminal_newlines, rendered_terminal_rows};
+    use crate::config::LogTimeFormat;
+    use std::time::{Duration, Instant, SystemTime};
+
+    #[test]
+    fn timestamps_use_the_time_the_entry_was_logged() {
+        let start_time = Instant::now();
+        let at = LogTime {
+            instant: start_time + Duration::from_millis(1500),
+            wall: SystemTime::UNIX_EPOCH + Duration::from_millis(3_723_456),
+        };
+        assert_eq!(
+            at.format(Some(LogTimeFormat::Uptime), start_time),
+            "  1.50s "
+        );
+        assert_eq!(
+            at.format(Some(LogTimeFormat::Date), start_time),
+            "01:02:03:456 "
+        );
+    }
 
     #[test]
     fn rendered_rows_include_wrapping_and_trailing_newlines() {
