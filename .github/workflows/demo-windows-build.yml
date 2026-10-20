@@ -18,6 +18,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # steel-utils' build script generates the builtin datapacks that steel-worldgen's build
+      # script reads, without a declared ordering between them, so generate them first.
+      - name: Generate shared build assets
+        run: cargo build --release -p steel-utils
       - name: Build portable release binary
         run: cargo build --release --features stand-alone,deadlock_detection --verbose
       - name: Name the executable after the demo
