@@ -107,5 +107,9 @@ name = "entity_tick"
 harness = false
 required-features = ["benchmark-support"]
 
+[[bench]]
+name = "flight"
+harness = false
+
 [lints]
 workspace = true
