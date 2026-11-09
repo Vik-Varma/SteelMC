@@ -109,7 +109,7 @@ impl StructureTemplate {
                 if rottable_blocks.as_ref().is_some_and(|tag| {
                     !registry
                         .blocks
-                        .is_in_tag(Self::block_for_state(registry, original.state), tag)
+                        .is_in_tag(Self::block_for_state(registry, current.state), tag)
                 }) {
                     return Some(current);
                 }
