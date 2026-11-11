@@ -17,12 +17,15 @@
 //! generation order, and better L1 locality since the cache lives on the sampler struct
 //! alongside the column cache. The only cost is one cold start per chunk (1/1536 lookups).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use rustc_hash::FxHashSet;
+use steel_math::out_from_origin;
 use steel_registry::biome::BiomeRef;
 use steel_registry::vanilla_biomes;
-use steel_utils::Identifier;
 use steel_utils::random::Random as _;
 use steel_utils::random::legacy_random::LegacyRandom;
+use steel_utils::{BlockPos, Direction, Identifier};
 use steel_worldgen::density_functions::nether::NetherColumnCache;
 use steel_worldgen::density_functions::overworld::OverworldColumnCache;
 use steel_worldgen::multi_noise::{
@@ -170,6 +173,65 @@ impl BiomeSourceKind {
             }
         }
         result
+    }
+
+    /// Vanilla's `BiomeSource.findClosestBiome3d`.
+    ///
+    /// Walks a square spiral of sample columns around `origin`, testing the heights from
+    /// [`out_from_origin`] in each, and returns the first possible biome `allowed` accepts.
+    /// One sampler serves the whole search, like vanilla's per-search caching resolver.
+    /// `min_y` and `max_y` are the level's inclusive build limits.
+    ///
+    /// Returns `None` when nothing matches, or early once `cancelled` is set.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "vanilla's search parameters plus the level height and a cancellation flag"
+    )]
+    pub fn find_closest_biome_3d(
+        &self,
+        origin: BlockPos,
+        search_radius: i32,
+        sample_resolution_horizontal: i32,
+        sample_resolution_vertical: i32,
+        allowed: &(impl Fn(BiomeRef) -> bool + ?Sized),
+        min_y: i32,
+        max_y: i32,
+        cancelled: &AtomicBool,
+    ) -> Option<(BlockPos, BiomeRef)> {
+        let candidates: Vec<BiomeRef> = self
+            .possible_biome_refs()
+            .into_iter()
+            .filter(|&biome| allowed(biome))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let sample_radius = search_radius.div_euclid(sample_resolution_horizontal);
+        let sample_ys: Vec<i32> =
+            out_from_origin(origin.y(), min_y + 1, max_y + 1, sample_resolution_vertical).collect();
+        let mut sampler = self.chunk_sampler();
+
+        for column in BlockPos::spiral_around(
+            BlockPos::ZERO,
+            sample_radius,
+            Direction::East,
+            Direction::South,
+        ) {
+            if cancelled.load(Ordering::Relaxed) {
+                return None;
+            }
+            let block_x = origin.x() + column.x() * sample_resolution_horizontal;
+            let block_z = origin.z() + column.z() * sample_resolution_horizontal;
+            for &block_y in &sample_ys {
+                let biome = sampler.sample(block_x >> 2, block_y >> 2, block_z >> 2);
+                if candidates.contains(&biome) {
+                    return Some((BlockPos::new(block_x, block_y, block_z), biome));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -522,6 +584,57 @@ mod tests {
             None
         );
         assert_eq!(rng.next_i64(), expected.next_i64());
+    }
+
+    #[test]
+    fn closest_biome_3d_samples_the_origin_column_first() {
+        let source = BiomeSourceKind::fixed(&vanilla_biomes::PLAINS);
+        let plains: BiomeRef = &vanilla_biomes::PLAINS;
+        let desert: BiomeRef = &vanilla_biomes::DESERT;
+        let search = |origin: BlockPos, allowed: &dyn Fn(BiomeRef) -> bool, cancelled: bool| {
+            let cancelled = AtomicBool::new(cancelled);
+            source.find_closest_biome_3d(origin, 6400, 32, 64, allowed, -64, 319, &cancelled)
+        };
+
+        // The origin's height is clamped into the sampled range [min_y + 1, max_y + 1].
+        assert_eq!(
+            search(BlockPos::new(37, -200, -5), &|_| true, false),
+            Some((BlockPos::new(37, -63, -5), plains))
+        );
+        assert_eq!(
+            search(BlockPos::new(37, 64, -5), &|biome| biome == desert, false),
+            None
+        );
+        assert_eq!(search(BlockPos::new(37, 64, -5), &|_| true, true), None);
+    }
+
+    #[test]
+    fn closest_biome_3d_returns_a_sampled_position_holding_the_biome() {
+        let source = BiomeSourceKind::overworld(0);
+        let desert: BiomeRef = &vanilla_biomes::DESERT;
+        let origin = BlockPos::new(100, 64, -300);
+        let Some((pos, biome)) = source.find_closest_biome_3d(
+            origin,
+            6400,
+            32,
+            64,
+            &|biome| biome == desert,
+            -64,
+            319,
+            &AtomicBool::new(false),
+        ) else {
+            panic!("seed 0 has a desert within 6400 blocks");
+        };
+
+        assert_eq!(biome, desert);
+        assert_eq!((pos.x() - origin.x()).rem_euclid(32), 0);
+        assert_eq!((pos.z() - origin.z()).rem_euclid(32), 0);
+        assert_eq!(
+            source
+                .chunk_sampler()
+                .sample(pos.x() >> 2, pos.y() >> 2, pos.z() >> 2),
+            desert
+        );
     }
 
     #[test]

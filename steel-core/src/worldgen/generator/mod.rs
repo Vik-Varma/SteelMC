@@ -17,20 +17,27 @@ pub use vanilla::{
     NoiseSpawnTarget, SteelPostNoiseState, VanillaGenerator, VanillaPostNoiseStateType,
 };
 
+use std::sync::LazyLock;
+
 use enum_dispatch::enum_dispatch;
 use glam::IVec3;
-use steel_registry::biome::BiomeRef;
+use steel_registry::{biome::BiomeRef, vanilla_biomes};
 use steel_utils::random::{
     PositionalRandom as _, Random as _, RandomSource, RandomSplitter, name_hash::NameHash,
     xoroshiro::Xoroshiro,
 };
 use steel_utils::{BlockPos, ChunkPos};
+use steel_worldgen::biomes::BiomeSourceKind;
 
 use self::context::{ChunkGeneratorType, EndGenerator, NetherGenerator, OverworldGenerator};
 use crate::chunk::Chunk;
 use crate::worldgen::region::WorldGenRegion;
 use crate::worldgen::structure::StructureGenerator;
 use steel_worldgen::noise::Beardifier;
+
+/// Biome source of the generators that produce plains everywhere (flat and empty worlds).
+static PLAINS_BIOME_SOURCE: LazyLock<BiomeSourceKind> =
+    LazyLock::new(|| BiomeSourceKind::fixed(&vanilla_biomes::PLAINS));
 
 /// A trait for generating chunks.
 #[enum_dispatch]
@@ -43,6 +50,9 @@ pub trait ChunkGenerator: Send + Sync {
 
     /// Returns the generator biome at one quart position without requiring a loaded chunk.
     fn noise_biome(&self, quart_x: i32, quart_y: i32, quart_z: i32) -> BiomeRef;
+
+    /// Returns the biome source used for chunk-independent biome searches.
+    fn biome_source(&self) -> &BiomeSourceKind;
 
     /// Returns the climate-selected origin used by vanilla before searching for a safe spawn chunk.
     fn initial_spawn_search_origin(&self) -> BlockPos {

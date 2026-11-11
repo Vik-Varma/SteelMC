@@ -25,6 +25,21 @@ impl BiomeOrTag {
             Self::Tag(tag) => biome.has_tag(tag),
         }
     }
+
+    pub(crate) fn as_printable(&self) -> String {
+        match self {
+            Self::Biome(biome) => biome.key.to_string(),
+            Self::Tag(tag) => format!("#{tag}"),
+        }
+    }
+
+    /// Names a search result, adding the matched biome when the query is a tag.
+    pub(crate) fn found_name(&self, found: BiomeRef) -> String {
+        match self {
+            Self::Biome(_) => self.as_printable(),
+            Self::Tag(tag) => format!("#{tag} ({})", found.key),
+        }
+    }
 }
 
 pub(super) fn parse_biome_or_tag(
