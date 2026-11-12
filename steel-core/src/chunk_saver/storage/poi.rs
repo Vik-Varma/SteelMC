@@ -69,6 +69,9 @@ impl ChunkStorage {
         if cancelled.load(Ordering::Relaxed) {
             return Err(poi_search_cancelled());
         }
+        if saved.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let (sender, receiver) = oneshot::channel();
         let cancelled = Arc::clone(cancelled);
@@ -203,13 +206,17 @@ const fn section_offset(origin: BlockPos, index: usize) -> BlockPos {
 #[cfg(test)]
 mod tests {
     use std::{
+        io,
         sync::{Arc, atomic::AtomicBool},
         time::Duration,
     };
 
     use steel_registry::{RegistryEntry, vanilla_blocks, vanilla_poi_types};
     use steel_utils::{BlockPos, ChunkPos, types::UpdateFlags};
-    use tokio::time::{sleep, timeout};
+    use tokio::{
+        runtime::Builder,
+        time::{sleep, timeout},
+    };
 
     use super::super::ChunkStorage;
     use crate::{
@@ -254,8 +261,14 @@ mod tests {
                 .expect("test pool should build"),
         );
         let (min_y, height) = (world.get_min_y(), world.get_height());
+        // A runtime of its own: while the test awaits, only the scan task can run on it, so
+        // the scan reliably reaches the pool before the checks below.
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should start");
 
-        world.chunk_map.chunk_runtime.block_on(async {
+        runtime.block_on(async {
             assert!(matches!(
                 storage.save_chunk_data(prepare(), &pool).await,
                 Ok(true)
@@ -295,6 +308,17 @@ mod tests {
                 .try_id()
                 .expect("vanilla lodestone POI type should be registered");
             assert_eq!(found, [(chunk_pos, vec![(lodestone_pos, lodestone)])]);
+
+            // A cancelled scan stops before scanning anything.
+            let _busy = block_pool(&pool);
+            let cancelled = Arc::new(AtomicBool::new(true));
+            let positions = [chunk_pos];
+            let scan = storage.saved_chunk_pois(&positions, min_y, height, &pool, &cancelled);
+            let result = timeout(Duration::from_secs(5), scan).await;
+            assert!(
+                matches!(result, Ok(Err(ref error)) if error.kind() == io::ErrorKind::Interrupted),
+                "a cancelled scan must end without waiting for the pool"
+            );
         });
     }
 }

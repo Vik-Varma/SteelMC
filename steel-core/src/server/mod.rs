@@ -175,8 +175,8 @@ fn configured_chunk_encoding_threads(configured_threads: Option<usize>) -> Optio
 /// Builds the pool `/locate biome` and `/locate poi` search on.
 ///
 /// A biome search that finds nothing samples about a million climate points, so searches stay
-/// off the shared chunk generation pool. One thread runs them one at a time, as vanilla runs
-/// them on the server thread.
+/// off the shared chunk generation pool. Their jobs queue on one thread, as vanilla runs
+/// searches one at a time on the server thread.
 fn locate_search_pool() -> Result<ThreadPool, String> {
     let mut builder = ThreadPoolBuilder::new()
         .num_threads(1)

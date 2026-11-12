@@ -3092,6 +3092,11 @@ fn run_command(server: &Server, source: CommandSource, command: &str) {
 /// Runs `command` as the console, polling suspensions until it finishes, and returns the
 /// reported results.
 fn run_command_to_completion(server: &Arc<Server>, command: &str) -> Vec<(bool, i32)> {
+    run_command_within(server, command, Duration::from_secs(30))
+}
+
+/// [`run_command_to_completion`] that fails once `limit` passes.
+fn run_command_within(server: &Arc<Server>, command: &str, limit: Duration) -> Vec<(bool, i32)> {
     let results = Arc::new(SyncMutex::new(Vec::new()));
     let recorded = Arc::clone(&results);
     let callback = CommandResultCallback::new(move |success, value| {
@@ -3113,10 +3118,7 @@ fn run_command_to_completion(server: &Arc<Server>, command: &str) -> Vec<(bool, 
     let mut stop = execution.run();
     let started = Instant::now();
     while stop == ExecutionStop::Suspended {
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "{command} should finish"
-        );
+        assert!(started.elapsed() < limit, "{command} should finish");
         thread::sleep(Duration::from_millis(1));
         stop = execution.poll_suspension();
     }
@@ -4657,19 +4659,23 @@ fn locate_searches_finish_while_every_generation_thread_is_busy() {
             UpdateFlags::UPDATE_ALL,
         ));
 
-        // Searches must not need a chunk generation thread.
+        // Searches must not need a chunk generation thread. Test worlds share this pool, so
+        // keep it blocked only briefly even if that regresses.
         let _busy = block_pool(&world.chunk_map.generation_pool);
+        let limit = Duration::from_secs(5);
         assert_eq!(
-            run_command_to_completion(
+            run_command_within(
                 &server,
-                "execute positioned 0 64 0 run locate biome minecraft:plains"
+                "execute positioned 0 64 0 run locate biome minecraft:plains",
+                limit,
             ),
             [(true, 0)]
         );
         assert_eq!(
-            run_command_to_completion(
+            run_command_within(
                 &server,
-                "execute positioned 0 64 0 run locate poi minecraft:meeting"
+                "execute positioned 0 64 0 run locate poi minecraft:meeting",
+                limit,
             ),
             [(true, 5)]
         );

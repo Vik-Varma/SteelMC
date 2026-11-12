@@ -25,11 +25,14 @@ use crate::{
 
 /// The chunks a vanilla POI square query visits, captured with any in-memory holder.
 ///
-/// Holders are kept as weak references so a pending search never holds up unloading. A
-/// holder that is gone by scan time was finalized, which only happens once it is saved, so
-/// storage then has its data.
+/// Holders are kept as weak references so a pending search never holds up unloading. At scan
+/// time the chunk's current holder wins, so a chunk unloaded and loaded again in the meantime
+/// is read live. Otherwise the captured holder is used while it is alive (it may be between
+/// the active and unloading maps, or finalized, whose blocks match its save), and only
+/// without either is storage read; holders are finalized only after saving.
 pub struct PoiSquareColumns {
     columns: Vec<(ChunkPos, Option<Weak<ChunkHolder>>)>,
+    chunk_map: Weak<ChunkMap>,
     min_y: i32,
     height: i32,
 }
@@ -38,7 +41,7 @@ impl PoiSquareColumns {
     /// Captures the chunks `PoiManager.getInSquare` visits around `center`, in its order
     /// (x fastest, then z).
     #[must_use]
-    pub fn capture(chunk_map: &ChunkMap, center: BlockPos, radius: i32) -> Self {
+    pub fn capture(chunk_map: &Arc<ChunkMap>, center: BlockPos, radius: i32) -> Self {
         let center_chunk = ChunkPos::from_block_pos(center);
         let chunk_radius = radius.div_euclid(16) + 1;
         let side = (2 * chunk_radius + 1) as usize;
@@ -46,19 +49,13 @@ impl PoiSquareColumns {
         for z in center_chunk.0.y - chunk_radius..=center_chunk.0.y + chunk_radius {
             for x in center_chunk.0.x - chunk_radius..=center_chunk.0.x + chunk_radius {
                 let pos = ChunkPos::new(x, z);
-                let holder = chunk_map
-                    .chunks
-                    .read_sync(&pos, |_, holder| Arc::downgrade(holder))
-                    .or_else(|| {
-                        chunk_map
-                            .unloading_chunks
-                            .read_sync(&pos, |_, holder| Arc::downgrade(holder))
-                    });
+                let holder = current_holder(chunk_map, pos).map(|holder| Arc::downgrade(&holder));
                 columns.push((pos, holder));
             }
         }
         Self {
             columns,
+            chunk_map: Arc::downgrade(chunk_map),
             min_y: chunk_map.world_gen_context.min_y(),
             height: chunk_map.world_gen_context.height(),
         }
@@ -81,14 +78,18 @@ impl PoiSquareColumns {
         let (sender, receiver) = oneshot::channel();
         let scan_cancelled = Arc::clone(cancelled);
         thread_pool.spawn(move || {
+            let chunk_map = self.chunk_map.upgrade();
             let mut scanned = Vec::with_capacity(self.columns.len());
             for (chunk_pos, holder) in self.columns {
                 if scan_cancelled.load(Ordering::Relaxed) {
                     let _ = sender.send(Err(poi_search_cancelled()));
                     return;
                 }
+                let holder = chunk_map
+                    .as_deref()
+                    .and_then(|chunk_map| current_holder(chunk_map, chunk_pos))
+                    .or_else(|| holder.and_then(|holder| holder.upgrade()));
                 let in_memory = holder.and_then(|holder| {
-                    let holder = holder.upgrade()?;
                     let chunk = holder.try_chunk(ChunkStatus::Empty)?;
                     Some(in_memory_pois(chunk, chunk_pos))
                 });
@@ -121,6 +122,18 @@ impl PoiSquareColumns {
         }
         Ok(found)
     }
+}
+
+/// The holder at `pos`, active or pending unload.
+fn current_holder(chunk_map: &ChunkMap, pos: ChunkPos) -> Option<Arc<ChunkHolder>> {
+    chunk_map
+        .chunks
+        .read_sync(&pos, |_, holder| Arc::clone(holder))
+        .or_else(|| {
+            chunk_map
+                .unloading_chunks
+                .read_sync(&pos, |_, holder| Arc::clone(holder))
+        })
 }
 
 fn in_memory_pois(chunk: &Chunk, chunk_pos: ChunkPos) -> Vec<SavedPoi> {

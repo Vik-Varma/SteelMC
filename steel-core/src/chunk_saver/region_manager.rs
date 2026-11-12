@@ -1079,6 +1079,13 @@ mod tests {
         assert_eq!(read[0].0, saved);
         assert_eq!(read[0].1.as_deref().ok(), Some(&payload[..]));
         assert!(manager.regions.read().await.is_empty());
+        assert!(
+            manager
+                .read_saved_chunks(&[saved], &AtomicBool::new(true))
+                .await
+                .is_empty(),
+            "a cancelled read stops before reading"
+        );
         let other_region_pos = RegionPos::from_chunk(other_region.0.x, other_region.0.y);
         assert!(!directory.join(other_region_pos.filename()).exists());
 
