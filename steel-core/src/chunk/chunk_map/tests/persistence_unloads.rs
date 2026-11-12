@@ -360,6 +360,7 @@ fn pending_poi_search_does_not_pin_captured_chunks() {
     let columns = PoiSquareColumns::capture(&world.chunk_map, BlockPos::new(0, 64, 0), 16);
 
     // The captured chunk still saves and finalizes while the search is pending.
+    let captured = Arc::downgrade(&holder);
     world.chunk_map.update_chunk_level(chunk_pos, None);
     world.chunk_map.rebuild_ticking_chunk_snapshot();
     drop(holder);
@@ -376,7 +377,12 @@ fn pending_poi_search_does_not_pin_captured_chunks() {
         }
     }
 
-    // Its POIs then come from storage.
+    // Once the next tick releases the finalized holder, its POIs come from storage.
+    world.chunk_map.finish_block_entity_unloads();
+    assert!(
+        captured.upgrade().is_none(),
+        "the finalized holder should be gone"
+    );
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()

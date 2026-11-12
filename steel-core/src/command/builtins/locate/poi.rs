@@ -163,9 +163,10 @@ mod tests {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+        time::Duration,
     };
 
-    use tokio::{runtime::Builder, sync::oneshot};
+    use tokio::{runtime::Builder, sync::oneshot, time::timeout};
 
     use super::BackgroundSearch;
 
@@ -197,8 +198,10 @@ mod tests {
                 cancelled.load(Ordering::Relaxed),
                 "pool work must see the cancel flag"
             );
+            let ended =
+                runtime.block_on(async { timeout(Duration::from_secs(5), task_ended).await });
             assert!(
-                runtime.block_on(task_ended).is_err(),
+                matches!(ended, Ok(Err(_))),
                 "the async task must be aborted"
             );
         }

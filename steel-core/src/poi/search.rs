@@ -30,6 +30,10 @@ use crate::{
 /// is read live. Otherwise the captured holder is used while it is alive (it may be between
 /// the active and unloading maps, or finalized, whose blocks match its save), and only
 /// without either is storage read; holders are finalized only after saving.
+///
+/// The scan looks the current holder up off the server thread, and a holder moves between the
+/// active and unloading maps in two steps. A holder caught mid-move is therefore missed; if it
+/// was not captured either, its chunk is read from storage, which lacks changes not yet saved.
 pub struct PoiSquareColumns {
     columns: Vec<(ChunkPos, Option<Weak<ChunkHolder>>)>,
     chunk_map: Weak<ChunkMap>,
