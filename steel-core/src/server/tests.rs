@@ -3089,6 +3089,41 @@ fn run_command(server: &Server, source: CommandSource, command: &str) {
     assert!(matches!(execution.run(), ExecutionStop::Completed));
 }
 
+/// Runs `command` as the console, polling suspensions until it finishes, and returns the
+/// reported results.
+fn run_command_to_completion(server: &Arc<Server>, command: &str) -> Vec<(bool, i32)> {
+    let results = Arc::new(SyncMutex::new(Vec::new()));
+    let recorded = Arc::clone(&results);
+    let callback = CommandResultCallback::new(move |success, value| {
+        recorded.lock().push((success, value));
+    });
+    let source =
+        CommandSource::new(CommandSender::Console, Arc::clone(server)).with_callback(callback);
+    let chain = {
+        let dispatcher = server.command_dispatcher.read();
+        let parse = dispatcher.parse(command, source.clone());
+        dispatcher.context_chain(parse)
+    };
+    let Ok(chain) = chain else {
+        panic!("{command} should parse");
+    };
+    let mut execution = CommandExecutionContext::for_source(&source);
+    execution.queue_initial_command(chain, source, CommandResultCallback::empty());
+
+    let mut stop = execution.run();
+    let started = Instant::now();
+    while stop == ExecutionStop::Suspended {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{command} should finish"
+        );
+        thread::sleep(Duration::from_millis(1));
+        stop = execution.poll_suspension();
+    }
+    assert_eq!(stop, ExecutionStop::Completed);
+    results.lock().clone()
+}
+
 fn packet_id(packet: &EncodedPacket) -> i32 {
     let mut cursor = Cursor::new(packet.encoded_data.as_slice());
     assert!(
@@ -4519,38 +4554,7 @@ fn locate_biome_command_finishes_from_the_generation_pool_with_vanilla_distances
             panic!("test server should initialize");
         };
 
-        let locate = |command: &str| {
-            let results = Arc::new(SyncMutex::new(Vec::new()));
-            let recorded = Arc::clone(&results);
-            let callback = CommandResultCallback::new(move |success, value| {
-                recorded.lock().push((success, value));
-            });
-            let source = CommandSource::new(CommandSender::Console, Arc::clone(&server))
-                .with_callback(callback);
-            let chain = {
-                let dispatcher = server.command_dispatcher.read();
-                let parse = dispatcher.parse(command, source.clone());
-                dispatcher.context_chain(parse)
-            };
-            let Ok(chain) = chain else {
-                panic!("{command} should parse");
-            };
-            let mut execution = CommandExecutionContext::for_source(&source);
-            execution.queue_initial_command(chain, source, CommandResultCallback::empty());
-
-            let mut stop = execution.run();
-            let started = Instant::now();
-            while stop == ExecutionStop::Suspended {
-                assert!(
-                    started.elapsed() < Duration::from_secs(30),
-                    "{command} should finish"
-                );
-                thread::sleep(Duration::from_millis(1));
-                stop = execution.poll_suspension();
-            }
-            assert_eq!(stop, ExecutionStop::Completed);
-            results.lock().clone()
-        };
+        let locate = |command: &str| run_command_to_completion(&server, command);
 
         // The empty generator is plains everywhere, so the origin column matches at the
         // lowest sampled height, y = min_y + 1 = -63: a 3D distance of 137.
@@ -4559,6 +4563,71 @@ fn locate_biome_command_finishes_from_the_generation_pool_with_vanilla_distances
             [(true, 137)]
         );
         assert_eq!(locate("locate biome minecraft:desert"), [(false, 0)]);
+    });
+}
+
+#[test]
+fn locate_poi_command_finds_pois_in_loaded_and_saved_chunks() {
+    use crate::block_entity::init_block_entities;
+    use crate::chunk::status::ChunkStatus;
+    use crate::chunk_saver::ChunkStorage;
+
+    init_vanilla_registry();
+    init_behaviors();
+    init_block_entities();
+    let world_fixture = fresh_test_world("locate-poi-command");
+    let world = &world_fixture.world;
+    let runtime = Builder::new_current_thread().enable_all().build();
+    let Ok(runtime) = runtime else {
+        panic!("test runtime should initialize");
+    };
+    runtime.block_on(async {
+        let server = test_server(Arc::clone(world), PermissionSubjectIndex::new()).await;
+        let Ok(server) = server else {
+            panic!("test server should initialize");
+        };
+
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+        assert!(world.set_block(
+            BlockPos::new(5, 64, 3),
+            vanilla_blocks::BELL.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+
+        // Save a chunk holding a lodestone, then drop it from memory.
+        let saved_pos = ChunkPos::new(3, 0);
+        let saved_holder = insert_ready_full_chunk(world, saved_pos);
+        assert!(world.set_block(
+            BlockPos::new(50, 70, 2),
+            vanilla_blocks::LODESTONE.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+        let Some(chunk) = saved_holder.try_chunk(ChunkStatus::Full) else {
+            panic!("inserted chunk should be Full");
+        };
+        let Some(prepared) = ChunkStorage::prepare_chunk_save(chunk, ChunkStatus::Full, &[], true)
+        else {
+            panic!("a forced save should be prepared");
+        };
+        let saved = world
+            .chunk_map
+            .storage
+            .save_chunk_data(prepared, &world.chunk_map.generation_pool)
+            .await;
+        assert!(matches!(saved, Ok(true)));
+        let _ = world.chunk_map.chunks.remove_sync(&saved_pos);
+        drop(saved_holder);
+        assert!(!world.chunk_map.unloading_chunks.contains_sync(&saved_pos));
+
+        let locate = |query: &str| {
+            run_command_to_completion(
+                &server,
+                &format!("execute positioned 0 64 0 run locate poi {query}"),
+            )
+        };
+        assert_eq!(locate("minecraft:meeting"), [(true, 5)]);
+        assert_eq!(locate("minecraft:lodestone"), [(true, 50)]);
+        assert_eq!(locate("#minecraft:acquirable_job_site"), [(false, 0)]);
     });
 }
 

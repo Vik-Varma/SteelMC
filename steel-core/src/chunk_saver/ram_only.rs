@@ -5,7 +5,7 @@ use steel_utils::{ChunkPos, locks::AsyncRwLock};
 
 use crate::world::World;
 
-use super::{ChunkStorage, LoadedChunk, PreparedChunkSave};
+use super::{ChunkStorage, LoadedChunk, PreparedChunkSave, SavedPoi};
 
 /// In-memory chunk storage.
 ///
@@ -81,5 +81,24 @@ impl RamOnlyStorage {
     /// Checks if a chunk exists in storage.
     pub async fn chunk_exists(&self, pos: ChunkPos) -> io::Result<bool> {
         Ok(self.saved_chunks.read().await.contains_key(&pos))
+    }
+
+    /// Returns the POI blocks of saved chunks, by chunk, without loading them.
+    pub async fn saved_chunk_pois(
+        &self,
+        positions: &[ChunkPos],
+        min_y: i32,
+        height: i32,
+    ) -> Vec<(ChunkPos, Vec<SavedPoi>)> {
+        let saved_chunks = self.saved_chunks.read().await;
+        positions
+            .iter()
+            .filter_map(|&pos| {
+                let saved = saved_chunks.get(&pos)?;
+                let pois =
+                    ChunkStorage::persistent_pois(&saved.prepared.persistent, pos, min_y, height);
+                ChunkStorage::readable_pois(pos, pois)
+            })
+            .collect()
     }
 }

@@ -63,6 +63,15 @@ pub struct PreparedChunkSave {
     pub handled_runtime_entity_ids: Vec<i32>,
 }
 
+/// A region file's chunk table, or the format version that kept it from being read.
+enum RegionTable {
+    Current {
+        header: RegionHeader,
+        file_sectors: u32,
+    },
+    OtherVersion(u16),
+}
+
 /// An open region file with its header.
 struct RegionHandle {
     /// File handle for reading/writing.
@@ -110,6 +119,34 @@ impl RegionManager {
             .open(&path)
             .await?;
 
+        match Self::read_region_table(&mut file).await? {
+            RegionTable::Current {
+                header,
+                file_sectors,
+            } => Ok(RegionHandle {
+                file,
+                header,
+                loaded_chunk_count: 0,
+                header_dirty: false,
+                file_sectors,
+            }),
+            RegionTable::OtherVersion(version) => {
+                // Version mismatch — backup the old file and create a fresh region.
+                drop(file);
+                let backup_path = path.with_extension(format!("srg.v{version}.bak"));
+                tracing::warn!(
+                    "Region file {} has version {version} (expected {FORMAT_VERSION}), backing up to {} and recreating",
+                    path.display(),
+                    backup_path.display()
+                );
+                fs::rename(&path, &backup_path).await?;
+                self.create_region(pos).await
+            }
+        }
+    }
+
+    /// Reads and validates a region file's magic, version and chunk table.
+    async fn read_region_table(file: &mut File) -> io::Result<RegionTable> {
         // Read and verify magic + version
         let mut header_bytes = [0u8; FILE_HEADER_SIZE];
         file.read_exact(&mut header_bytes).await?;
@@ -124,16 +161,7 @@ impl RegionManager {
 
         let version = u16::from_le_bytes([header_bytes[4], header_bytes[5]]);
         if version != FORMAT_VERSION {
-            // Version mismatch — backup the old file and create a fresh region.
-            drop(file);
-            let backup_path = path.with_extension(format!("srg.v{version}.bak"));
-            tracing::warn!(
-                "Region file {} has version {version} (expected {FORMAT_VERSION}), backing up to {} and recreating",
-                path.display(),
-                backup_path.display()
-            );
-            fs::rename(&path, &backup_path).await?;
-            return self.create_region(pos).await;
+            return Ok(RegionTable::OtherVersion(version));
         }
 
         // Read chunk table
@@ -151,11 +179,8 @@ impl RegionManager {
         let file_sectors = file_size.div_ceil(SECTOR_SIZE as u64) as u32;
         Self::validate_region_entries(&header, file_sectors)?;
 
-        Ok(RegionHandle {
-            file,
+        Ok(RegionTable::Current {
             header,
-            loaded_chunk_count: 0,
-            header_dirty: false,
             file_sectors,
         })
     }
@@ -647,6 +672,87 @@ impl RegionManager {
         Ok(entry.exists())
     }
 
+    /// Reads the compressed payloads of saved chunks without loading or creating anything.
+    ///
+    /// Missing chunks are left out. An open region is read through its handle, since its
+    /// on-disk chunk table is only rewritten when the region closes; any other region is
+    /// read through a temporary read-only handle. Each region's reads hold the region lock
+    /// so a concurrent save cannot move a chunk mid-read.
+    pub async fn read_saved_chunks(
+        &self,
+        positions: &[ChunkPos],
+    ) -> Vec<(ChunkPos, io::Result<Vec<u8>>)> {
+        let mut by_region: FxHashMap<RegionPos, Vec<ChunkPos>> = FxHashMap::default();
+        for &pos in positions {
+            by_region
+                .entry(RegionPos::from_chunk(pos.0.x, pos.0.y))
+                .or_default()
+                .push(pos);
+        }
+
+        let mut saved = Vec::new();
+        for (region_pos, chunks) in by_region {
+            let mut regions = self.regions.write().await;
+            let mut unopened = None;
+            let (file, header, file_sectors) = if let Some(handle) = regions.get_mut(&region_pos) {
+                (&mut handle.file, &handle.header, handle.file_sectors)
+            } else {
+                match self.open_region_read_only(region_pos).await {
+                    Ok(Some(region)) => {
+                        let (file, header, file_sectors) = unopened.insert(region);
+                        (file, &*header, *file_sectors)
+                    }
+                    Ok(None) => continue,
+                    Err(error) => {
+                        let message = error.to_string();
+                        saved.extend(chunks.into_iter().map(|pos| {
+                            let error = io::Error::new(error.kind(), message.clone());
+                            (pos, Err(error))
+                        }));
+                        continue;
+                    }
+                }
+            };
+
+            for pos in chunks {
+                let (local_x, local_z) = RegionPos::local_chunk_pos(pos.0.x, pos.0.y);
+                let entry = header.entries[RegionHeader::chunk_index(local_x, local_z)];
+                if !entry.exists() {
+                    continue;
+                }
+                let data = match Self::validate_chunk_entry(entry, file_sectors) {
+                    Ok(()) => {
+                        Self::read_chunk_data(file, entry.sector_offset, entry.size_bytes).await
+                    }
+                    Err(error) => Err(error),
+                };
+                saved.push((pos, data));
+            }
+            drop(regions);
+        }
+        saved
+    }
+
+    /// Opens an existing region for reading only. Returns `None` when there is no current
+    /// region file, including one from another format version that `open_region` would replace.
+    async fn open_region_read_only(
+        &self,
+        pos: RegionPos,
+    ) -> io::Result<Option<(File, RegionHeader, u32)>> {
+        let mut file = match File::open(self.region_path(pos)).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match Self::read_region_table(&mut file).await? {
+            RegionTable::Current {
+                header,
+                file_sectors,
+            } => Ok(Some((file, header, file_sectors))),
+            RegionTable::OtherVersion(_) => Ok(None),
+        }
+    }
+
     /// Flushes all dirty headers to disk.
     pub async fn flush_all(&self) -> io::Result<()> {
         let mut regions = self.regions.write().await;
@@ -967,6 +1073,54 @@ mod tests {
             .expect("status byte should remain readable");
         assert_eq!(status[0], u8::MAX);
 
+        fs::remove_dir_all(directory)
+            .await
+            .expect("test directory should be removable");
+    }
+
+    #[tokio::test]
+    async fn saved_chunk_reads_never_create_or_open_regions_and_prefer_open_tables() {
+        let directory = test_directory("saved_reads");
+        let saved = ChunkPos::new(3, 4);
+        let unsaved = ChunkPos::new(5, 4);
+        let other_region = ChunkPos::new(40, 4);
+        let payload = b"compressed chunk bytes";
+        write_test_region(&directory, saved, payload, payload.len() as u32)
+            .await
+            .expect("test region should be written");
+        let manager = RegionManager::new(&directory);
+
+        let read = manager
+            .read_saved_chunks(&[saved, unsaved, other_region])
+            .await;
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].0, saved);
+        assert_eq!(read[0].1.as_deref().ok(), Some(&payload[..]));
+        assert!(manager.regions.read().await.is_empty());
+        let other_region_pos = RegionPos::from_chunk(other_region.0.x, other_region.0.y);
+        assert!(!directory.join(other_region_pos.filename()).exists());
+
+        // A save into an open region only updates its in-memory chunk table until it closes.
+        assert!(
+            manager
+                .acquire_chunk(saved)
+                .await
+                .expect("region should open")
+        );
+        {
+            let mut regions = manager.regions.write().await;
+            let handle = regions
+                .get_mut(&RegionPos::from_chunk(saved.0.x, saved.0.y))
+                .expect("acquired region should be open");
+            let (local_x, local_z) = RegionPos::local_chunk_pos(unsaved.0.x, unsaved.0.y);
+            handle.header.entries[RegionHeader::chunk_index(local_x, local_z)] =
+                ChunkEntry::new(FIRST_DATA_SECTOR, payload.len() as u32, ChunkStatus::Full);
+        }
+        let read = manager.read_saved_chunks(&[unsaved]).await;
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].1.as_deref().ok(), Some(&payload[..]));
+
+        manager.close_all().await.expect("regions should close");
         fs::remove_dir_all(directory)
             .await
             .expect("test directory should be removable");

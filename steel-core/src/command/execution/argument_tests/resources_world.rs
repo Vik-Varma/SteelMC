@@ -45,6 +45,59 @@ fn biome_or_tag_argument_resolves_registry_entries_and_tags() {
 }
 
 #[test]
+fn poi_type_or_tag_argument_resolves_registry_entries_and_tags() {
+    init_vanilla_registry();
+    let dispatcher = resource_dispatcher(SteelArgumentType::poi_type_or_tag());
+
+    let parse = dispatcher.parse("resource bee_nest", TestSource::new());
+    let Ok(chain) = dispatcher.context_chain(parse) else {
+        panic!("registered POI type should parse");
+    };
+    let Ok(poi_type) = chain.top_context().poi_type_or_tag("value") else {
+        panic!("POI type should be retained");
+    };
+    assert!(poi_type.matches(&vanilla_poi_types::BEE_NEST));
+    assert!(!poi_type.matches(&vanilla_poi_types::BEEHIVE));
+    assert_eq!(
+        poi_type.found_name(&vanilla_poi_types::BEE_NEST),
+        "minecraft:bee_nest"
+    );
+
+    let parse = dispatcher.parse("resource #bee_home", TestSource::new());
+    let Ok(chain) = dispatcher.context_chain(parse) else {
+        panic!("registered POI type tag should parse");
+    };
+    let Ok(tag) = chain.top_context().poi_type_or_tag("value") else {
+        panic!("POI type tag should be retained");
+    };
+    assert!(tag.matches(&vanilla_poi_types::BEEHIVE));
+    assert!(!tag.matches(&vanilla_poi_types::HOME));
+    assert_eq!(
+        tag.found_name(&vanilla_poi_types::BEEHIVE),
+        "#minecraft:bee_home (minecraft:beehive)"
+    );
+
+    for input in ["resource missing", "resource #missing"] {
+        let parse = dispatcher.parse(input, TestSource::new());
+        assert!(
+            dispatcher.context_chain(parse).is_err(),
+            "{input} should reject an unknown POI type or tag"
+        );
+    }
+
+    let parse = dispatcher.parse("resource #bee", TestSource::new());
+    let Ok(suggestions) = dispatcher.completion_suggestions(&parse) else {
+        panic!("POI type tag suggestions should build");
+    };
+    assert!(
+        suggestions
+            .list()
+            .iter()
+            .any(|suggestion| suggestion.text() == "#minecraft:bee_home")
+    );
+}
+
+#[test]
 fn structure_or_tag_key_argument_defers_registry_resolution_until_execution() {
     init_vanilla_registry();
     let dispatcher = resource_dispatcher(SteelArgumentType::structure_or_tag_key());

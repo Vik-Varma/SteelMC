@@ -62,8 +62,11 @@ use steel_worldgen::structure::{
 mod chunk;
 mod entities;
 mod light;
+mod poi;
 mod structures;
 mod ticks;
+
+pub use poi::SavedPoi;
 
 #[cfg(test)]
 mod tests;
