@@ -4,7 +4,7 @@ use crate::server::worlds::WorldMap;
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::slice;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Barrier, OnceLock, Weak, mpsc};
 
 use glam::DVec3;
 use steel_registry::blocks::{BlockRef, block_state_ext::BlockStateExt};
@@ -21,7 +21,7 @@ use steel_registry::{
     vanilla_fluids,
 };
 use steel_utils::types::{Difficulty, GameType, UpdateFlags};
-use steel_utils::{BlockPos, BlockStateId, Identifier, WorldAabb};
+use steel_utils::{BlockPos, BlockStateId, Identifier, WorldAabb, locks::SyncMutex};
 use steel_worldgen::density_functions::{
     end::EndNoiseSettings, nether::NetherNoiseSettings, overworld::OverworldNoiseSettings,
 };
@@ -674,4 +674,37 @@ pub(crate) fn fresh_test_derived_world(primary: &Arc<World>, name: &'static str)
         primary.dimension_type,
         GameTimeSource::Derived(Arc::clone(&primary.game_time)),
     )
+}
+
+/// Keeps every thread of a Rayon pool busy until dropped, so tests can prove work waits on
+/// (or avoids) that pool.
+pub(crate) struct BlockedPool {
+    release: Option<mpsc::Sender<()>>,
+}
+
+impl Drop for BlockedPool {
+    fn drop(&mut self) {
+        // Dropping the sender wakes every blocked thread.
+        self.release.take();
+    }
+}
+
+/// Occupies all of `pool`'s threads; they are released when the guard drops.
+pub(crate) fn block_pool(pool: &rayon::ThreadPool) -> BlockedPool {
+    let threads = pool.current_num_threads();
+    let started = Arc::new(Barrier::new(threads + 1));
+    let (release, wait) = mpsc::channel::<()>();
+    let wait = Arc::new(SyncMutex::new(wait));
+    for _ in 0..threads {
+        let started = Arc::clone(&started);
+        let wait = Arc::clone(&wait);
+        pool.spawn(move || {
+            started.wait();
+            let _ = wait.lock().recv();
+        });
+    }
+    started.wait();
+    BlockedPool {
+        release: Some(release),
+    }
 }

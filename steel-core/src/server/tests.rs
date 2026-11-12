@@ -3089,6 +3089,43 @@ fn run_command(server: &Server, source: CommandSource, command: &str) {
     assert!(matches!(execution.run(), ExecutionStop::Completed));
 }
 
+/// Runs `command` as the console, polling suspensions until it finishes, and returns the
+/// reported results.
+fn run_command_to_completion(server: &Arc<Server>, command: &str) -> Vec<(bool, i32)> {
+    run_command_within(server, command, Duration::from_secs(30))
+}
+
+/// [`run_command_to_completion`] that fails once `limit` passes.
+fn run_command_within(server: &Arc<Server>, command: &str, limit: Duration) -> Vec<(bool, i32)> {
+    let results = Arc::new(SyncMutex::new(Vec::new()));
+    let recorded = Arc::clone(&results);
+    let callback = CommandResultCallback::new(move |success, value| {
+        recorded.lock().push((success, value));
+    });
+    let source =
+        CommandSource::new(CommandSender::Console, Arc::clone(server)).with_callback(callback);
+    let chain = {
+        let dispatcher = server.command_dispatcher.read();
+        let parse = dispatcher.parse(command, source.clone());
+        dispatcher.context_chain(parse)
+    };
+    let Ok(chain) = chain else {
+        panic!("{command} should parse");
+    };
+    let mut execution = CommandExecutionContext::for_source(&source);
+    execution.queue_initial_command(chain, source, CommandResultCallback::empty());
+
+    let mut stop = execution.run();
+    let started = Instant::now();
+    while stop == ExecutionStop::Suspended {
+        assert!(started.elapsed() < limit, "{command} should finish");
+        thread::sleep(Duration::from_millis(1));
+        stop = execution.poll_suspension();
+    }
+    assert_eq!(stop, ExecutionStop::Completed);
+    results.lock().clone()
+}
+
 fn packet_id(packet: &EncodedPacket) -> i32 {
     let mut cursor = Cursor::new(packet.encoded_data.as_slice());
     assert!(
@@ -4502,7 +4539,7 @@ fn title_command_delivers_vanilla_packets_to_recorded_connections() {
 }
 
 #[test]
-fn locate_biome_command_finishes_from_the_generation_pool_with_vanilla_distances() {
+fn locate_biome_command_finishes_in_the_background_with_vanilla_distances() {
     use steel_registry::init_vanilla_registry;
 
     init_vanilla_registry();
@@ -4519,38 +4556,7 @@ fn locate_biome_command_finishes_from_the_generation_pool_with_vanilla_distances
             panic!("test server should initialize");
         };
 
-        let locate = |command: &str| {
-            let results = Arc::new(SyncMutex::new(Vec::new()));
-            let recorded = Arc::clone(&results);
-            let callback = CommandResultCallback::new(move |success, value| {
-                recorded.lock().push((success, value));
-            });
-            let source = CommandSource::new(CommandSender::Console, Arc::clone(&server))
-                .with_callback(callback);
-            let chain = {
-                let dispatcher = server.command_dispatcher.read();
-                let parse = dispatcher.parse(command, source.clone());
-                dispatcher.context_chain(parse)
-            };
-            let Ok(chain) = chain else {
-                panic!("{command} should parse");
-            };
-            let mut execution = CommandExecutionContext::for_source(&source);
-            execution.queue_initial_command(chain, source, CommandResultCallback::empty());
-
-            let mut stop = execution.run();
-            let started = Instant::now();
-            while stop == ExecutionStop::Suspended {
-                assert!(
-                    started.elapsed() < Duration::from_secs(30),
-                    "{command} should finish"
-                );
-                thread::sleep(Duration::from_millis(1));
-                stop = execution.poll_suspension();
-            }
-            assert_eq!(stop, ExecutionStop::Completed);
-            results.lock().clone()
-        };
+        let locate = |command: &str| run_command_to_completion(&server, command);
 
         // The empty generator is plains everywhere, so the origin column matches at the
         // lowest sampled height, y = min_y + 1 = -63: a 3D distance of 137.
@@ -4559,6 +4565,39 @@ fn locate_biome_command_finishes_from_the_generation_pool_with_vanilla_distances
             [(true, 137)]
         );
         assert_eq!(locate("locate biome minecraft:desert"), [(false, 0)]);
+    });
+}
+
+#[test]
+fn locate_searches_finish_while_every_generation_thread_is_busy() {
+    use crate::test_support::block_pool;
+
+    init_vanilla_registry();
+    init_behaviors();
+    let world_fixture = fresh_test_world("locate-busy-generation-pool");
+    let world = &world_fixture.world;
+    let runtime = Builder::new_current_thread().enable_all().build();
+    let Ok(runtime) = runtime else {
+        panic!("test runtime should initialize");
+    };
+    runtime.block_on(async {
+        let server = test_server(Arc::clone(world), PermissionSubjectIndex::new()).await;
+        let Ok(server) = server else {
+            panic!("test server should initialize");
+        };
+
+        // Searches must not need a chunk generation thread. Test worlds share this pool, so
+        // keep it blocked only briefly even if that regresses.
+        let _busy = block_pool(&world.chunk_map.generation_pool);
+        let limit = Duration::from_secs(5);
+        assert_eq!(
+            run_command_within(
+                &server,
+                "execute positioned 0 64 0 run locate biome minecraft:plains",
+                limit,
+            ),
+            [(true, 0)]
+        );
     });
 }
 
