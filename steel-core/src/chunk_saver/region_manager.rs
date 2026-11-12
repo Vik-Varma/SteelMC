@@ -8,7 +8,10 @@ use std::{
     fmt,
     io::{self},
     path::PathBuf,
-    sync::Weak,
+    sync::{
+        Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use rustc_hash::FxHashMap;
@@ -650,13 +653,18 @@ impl RegionManager {
     /// Reads the compressed payloads of saved chunks without loading or creating anything.
     ///
     /// Missing chunks are left out. Each chunk is read under its own short hold of the region
-    /// lock, so other chunk I/O can interleave with a long batch.
+    /// lock, so other chunk I/O can interleave with a long batch. Reading stops early once
+    /// `cancelled` is set.
     pub async fn read_saved_chunks(
         &self,
         positions: &[ChunkPos],
+        cancelled: &AtomicBool,
     ) -> Vec<(ChunkPos, io::Result<Vec<u8>>)> {
         let mut saved = Vec::new();
         for &pos in positions {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
             match self.read_saved_chunk(pos).await {
                 Ok(Some(data)) => saved.push((pos, Ok(data))),
                 Ok(None) => {}
@@ -1065,7 +1073,7 @@ mod tests {
         let manager = RegionManager::new(&directory);
 
         let read = manager
-            .read_saved_chunks(&[saved, unsaved, other_region])
+            .read_saved_chunks(&[saved, unsaved, other_region], &AtomicBool::new(false))
             .await;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].0, saved);
@@ -1090,7 +1098,9 @@ mod tests {
             handle.header.entries[RegionHeader::chunk_index(local_x, local_z)] =
                 ChunkEntry::new(FIRST_DATA_SECTOR, payload.len() as u32, ChunkStatus::Full);
         }
-        let read = manager.read_saved_chunks(&[unsaved]).await;
+        let read = manager
+            .read_saved_chunks(&[unsaved], &AtomicBool::new(false))
+            .await;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].1.as_deref().ok(), Some(&payload[..]));
 

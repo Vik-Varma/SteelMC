@@ -5,7 +5,13 @@
 //! [`PointOfInterestStorage`](super::PointOfInterestStorage) only covers loaded Full chunks,
 //! so these queries scan the blocks of in-memory chunks and read saved chunks from storage.
 
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use rayon::ThreadPool;
 use rustc_hash::FxHashMap;
@@ -14,12 +20,16 @@ use tokio::sync::oneshot;
 
 use crate::{
     chunk::{Chunk, chunk_holder::ChunkHolder, chunk_map::ChunkMap, status::ChunkStatus},
-    chunk_saver::{ChunkStorage, SavedPoi},
+    chunk_saver::{ChunkStorage, SavedPoi, poi_search_cancelled},
 };
 
 /// The chunks a vanilla POI square query visits, captured with any in-memory holder.
+///
+/// Holders are kept as weak references so a pending search never holds up unloading. A
+/// holder that is gone by scan time was finalized, which only happens once it is saved, so
+/// storage then has its data.
 pub struct PoiSquareColumns {
-    columns: Vec<(ChunkPos, Option<Arc<ChunkHolder>>)>,
+    columns: Vec<(ChunkPos, Option<Weak<ChunkHolder>>)>,
     min_y: i32,
     height: i32,
 }
@@ -38,11 +48,11 @@ impl PoiSquareColumns {
                 let pos = ChunkPos::new(x, z);
                 let holder = chunk_map
                     .chunks
-                    .read_sync(&pos, |_, holder| Arc::clone(holder))
+                    .read_sync(&pos, |_, holder| Arc::downgrade(holder))
                     .or_else(|| {
                         chunk_map
                             .unloading_chunks
-                            .read_sync(&pos, |_, holder| Arc::clone(holder))
+                            .read_sync(&pos, |_, holder| Arc::downgrade(holder))
                     });
                 columns.push((pos, holder));
             }
@@ -58,31 +68,37 @@ impl PoiSquareColumns {
     /// the bottom, then y, z, x within a section.
     ///
     /// Chunks with in-memory data are scanned on `thread_pool`; the rest are read from
-    /// `storage`, and chunks that were never saved contribute nothing.
+    /// `storage`, and chunks that were never saved contribute nothing. Once `cancelled` is
+    /// set, the work stops at the next chunk and the call fails with
+    /// [`poi_search_cancelled`].
     pub async fn pois(
         self,
         storage: &ChunkStorage,
         thread_pool: &ThreadPool,
+        cancelled: &Arc<AtomicBool>,
     ) -> io::Result<Vec<SavedPoi>> {
         let (min_y, height) = (self.min_y, self.height);
         let (sender, receiver) = oneshot::channel();
+        let scan_cancelled = Arc::clone(cancelled);
         thread_pool.spawn(move || {
-            let scanned: Vec<_> = self
-                .columns
-                .into_iter()
-                .map(|(chunk_pos, holder)| {
-                    let in_memory = holder
-                        .as_deref()
-                        .and_then(|holder| holder.try_chunk(ChunkStatus::Empty))
-                        .map(|chunk| in_memory_pois(chunk, chunk_pos));
-                    (chunk_pos, in_memory)
-                })
-                .collect();
-            let _ = sender.send(scanned);
+            let mut scanned = Vec::with_capacity(self.columns.len());
+            for (chunk_pos, holder) in self.columns {
+                if scan_cancelled.load(Ordering::Relaxed) {
+                    let _ = sender.send(Err(poi_search_cancelled()));
+                    return;
+                }
+                let in_memory = holder.and_then(|holder| {
+                    let holder = holder.upgrade()?;
+                    let chunk = holder.try_chunk(ChunkStatus::Empty)?;
+                    Some(in_memory_pois(chunk, chunk_pos))
+                });
+                scanned.push((chunk_pos, in_memory));
+            }
+            let _ = sender.send(Ok(scanned));
         });
         let scanned = receiver
             .await
-            .map_err(|_| io::Error::other("in-memory POI scan ended without a result"))?;
+            .map_err(|_| io::Error::other("in-memory POI scan ended without a result"))??;
 
         let unloaded: Vec<ChunkPos> = scanned
             .iter()
@@ -90,7 +106,7 @@ impl PoiSquareColumns {
             .map(|&(pos, _)| pos)
             .collect();
         let mut saved: FxHashMap<ChunkPos, Vec<SavedPoi>> = storage
-            .saved_chunk_pois(&unloaded, min_y, height, thread_pool)
+            .saved_chunk_pois(&unloaded, min_y, height, thread_pool, cancelled)
             .await?
             .into_iter()
             .collect();
@@ -156,8 +172,17 @@ pub fn find_closest_with_type(
 
 #[cfg(test)]
 mod tests {
-    use super::find_closest_with_type;
-    use steel_utils::BlockPos;
+    use std::{
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    use super::{PoiSquareColumns, find_closest_with_type};
+    use crate::test_support::{block_pool, fresh_test_world, insert_ready_full_chunk};
+    use steel_utils::{BlockPos, ChunkPos};
 
     const HOME: usize = 1;
     const MEETING: usize = 2;
@@ -201,5 +226,36 @@ mod tests {
             find_closest_with_type(pois[1..].iter().copied(), |_| true, center, 256),
             Some((BlockPos::new(-10, 64, 0), MEETING))
         );
+    }
+
+    #[test]
+    fn cancelling_a_queued_search_ends_it_as_interrupted() {
+        steel_registry::init_vanilla_registry();
+        let world_fixture = fresh_test_world("poi-search-cancel");
+        let world = &world_fixture.world;
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+        let columns = PoiSquareColumns::capture(&world.chunk_map, BlockPos::new(0, 64, 0), 16);
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("test pool should build"),
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let blocked = block_pool(&pool);
+        let search = world.chunk_map.chunk_runtime.spawn({
+            let storage = Arc::clone(&world.chunk_map.storage);
+            let pool = Arc::clone(&pool);
+            let cancelled = Arc::clone(&cancelled);
+            async move { columns.pois(&storage, &pool, &cancelled).await }
+        });
+        cancelled.store(true, Ordering::Relaxed);
+        drop(blocked);
+
+        let Ok(result) = world.chunk_map.chunk_runtime.block_on(search) else {
+            panic!("the search task should finish");
+        };
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
     }
 }

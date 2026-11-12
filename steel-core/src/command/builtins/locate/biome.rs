@@ -29,11 +29,11 @@ const BIOME_SAMPLE_RESOLUTION_VERTICAL: i32 = 64;
 
 type SearchResult = Option<(BlockPos, BiomeRef)>;
 
-/// Starts the search on the world generation pool.
+/// Starts the search on the server's locate search pool.
 ///
 /// Vanilla searches on the server thread. When nothing matches, the search samples about
-/// 1.1 million climate points (seconds of CPU), so Steel runs it beside chunk generation
-/// and polls for the result instead of stalling ticks.
+/// 1.1 million climate points (seconds of CPU), so Steel runs it in the background and polls
+/// for the result instead of stalling ticks.
 pub(super) fn start_search(
     context: &SteelCommandContext<CommandSource>,
 ) -> Result<LocateBiomeSearch, CommandSyntaxError> {
@@ -48,7 +48,7 @@ pub(super) fn start_search(
 
     let search_query = query.clone();
     let search_cancelled = Arc::clone(&cancelled);
-    world.chunk_map.generation_pool.spawn(move || {
+    source.server().locate_search_pool.spawn(move || {
         let found = generator.biome_source().find_closest_biome_3d(
             origin,
             MAX_BIOME_SEARCH_RADIUS,

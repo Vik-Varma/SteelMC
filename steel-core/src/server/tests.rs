@@ -4632,6 +4632,51 @@ fn locate_poi_command_finds_pois_in_loaded_and_saved_chunks() {
 }
 
 #[test]
+fn locate_searches_finish_while_every_generation_thread_is_busy() {
+    use crate::block_entity::init_block_entities;
+    use crate::test_support::block_pool;
+
+    init_vanilla_registry();
+    init_behaviors();
+    init_block_entities();
+    let world_fixture = fresh_test_world("locate-busy-generation-pool");
+    let world = &world_fixture.world;
+    let runtime = Builder::new_current_thread().enable_all().build();
+    let Ok(runtime) = runtime else {
+        panic!("test runtime should initialize");
+    };
+    runtime.block_on(async {
+        let server = test_server(Arc::clone(world), PermissionSubjectIndex::new()).await;
+        let Ok(server) = server else {
+            panic!("test server should initialize");
+        };
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+        assert!(world.set_block(
+            BlockPos::new(5, 64, 3),
+            vanilla_blocks::BELL.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+
+        // Searches must not need a chunk generation thread.
+        let _busy = block_pool(&world.chunk_map.generation_pool);
+        assert_eq!(
+            run_command_to_completion(
+                &server,
+                "execute positioned 0 64 0 run locate biome minecraft:plains"
+            ),
+            [(true, 0)]
+        );
+        assert_eq!(
+            run_command_to_completion(
+                &server,
+                "execute positioned 0 64 0 run locate poi minecraft:meeting"
+            ),
+            [(true, 5)]
+        );
+    });
+}
+
+#[test]
 fn setblock_command_places_blocks_and_keep_mode_skips_occupied_positions() {
     use crate::block_entity::init_block_entities;
     use steel_registry::blocks::block_state_ext::BlockStateExt as _;

@@ -1,6 +1,13 @@
 //! `/locate poi`.
 
-use std::{io, sync::Arc, time::Instant};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 use steel_registry::{REGISTRY, RegistryExt as _};
 use steel_utils::{BlockPos, translations};
@@ -25,7 +32,7 @@ use crate::{
 
 const POI_SEARCH_RADIUS: i32 = 256;
 
-/// Starts the search on the chunk runtime.
+/// Starts the search on the chunk runtime and the server's locate search pool.
 ///
 /// The chunks in range are captured here, on the server thread. Vanilla reads POI data of
 /// unloaded chunks from disk while the server waits; Steel reads their saved chunks in the
@@ -39,20 +46,25 @@ pub(super) fn start_search(
     let origin = BlockPos::from(source.position());
     let columns = PoiSquareColumns::capture(&world.chunk_map, origin, POI_SEARCH_RADIUS);
     let storage = Arc::clone(&world.chunk_map.storage);
-    let thread_pool = Arc::clone(&world.chunk_map.generation_pool);
+    let thread_pool = Arc::clone(&source.server().locate_search_pool);
+    let cancelled = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = oneshot::channel();
 
     let search_query = query.clone();
+    let search_cancelled = Arc::clone(&cancelled);
     let task = world.chunk_map.chunk_runtime.spawn(async move {
-        let found = columns.pois(&storage, &thread_pool).await.map(|pois| {
-            let matches = |poi_type| {
-                REGISTRY
-                    .poi_types
-                    .by_id(poi_type)
-                    .is_some_and(|poi_type| search_query.matches(poi_type))
-            };
-            find_closest_with_type(pois, matches, origin, POI_SEARCH_RADIUS)
-        });
+        let found = columns
+            .pois(&storage, &thread_pool, &search_cancelled)
+            .await
+            .map(|pois| {
+                let matches = |poi_type| {
+                    REGISTRY
+                        .poi_types
+                        .by_id(poi_type)
+                        .is_some_and(|poi_type| search_query.matches(poi_type))
+                };
+                find_closest_with_type(pois, matches, origin, POI_SEARCH_RADIUS)
+            });
         // The command may have been cancelled and dropped its receiver.
         let _ = sender.send(found);
     });
@@ -63,6 +75,7 @@ pub(super) fn start_search(
         origin,
         receiver,
         task,
+        cancelled,
         started_at: Instant::now(),
     })
 }
@@ -73,7 +86,16 @@ pub(super) struct LocatePoiSearch {
     origin: BlockPos,
     receiver: oneshot::Receiver<io::Result<Option<SavedPoi>>>,
     task: JoinHandle<()>,
+    cancelled: Arc<AtomicBool>,
     started_at: Instant,
+}
+
+impl LocatePoiSearch {
+    /// Stops the search, including scan and decode work already queued on the pool.
+    fn stop(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.task.abort();
+    }
 }
 
 impl CommandResultSuspension for LocatePoiSearch {
@@ -110,14 +132,14 @@ impl CommandResultSuspension for LocatePoiSearch {
     }
 
     fn cancel(&mut self) {
-        self.task.abort();
+        self.stop();
     }
 }
 
 impl Drop for LocatePoiSearch {
     fn drop(&mut self) {
         // Stop the search if the command is discarded without being cancelled.
-        self.task.abort();
+        self.stop();
     }
 }
 

@@ -66,7 +66,7 @@ mod poi;
 mod structures;
 mod ticks;
 
-pub use poi::SavedPoi;
+pub use poi::{SavedPoi, poi_search_cancelled};
 
 #[cfg(test)]
 mod tests;
