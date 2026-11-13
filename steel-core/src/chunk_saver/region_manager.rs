@@ -119,6 +119,19 @@ impl RegionManager {
             .open(&path)
             .await?;
 
+        // A file too short for the chunk table holds no chunks: creating the region was cut
+        // short, as by a crash. Like vanilla, which reads a truncated header as empty, start
+        // the region over.
+        let file_size = file.metadata().await?.len();
+        if file_size < (FILE_HEADER_SIZE + CHUNK_TABLE_SIZE) as u64 {
+            drop(file);
+            tracing::warn!(
+                "Region file {} is {file_size} bytes, too short for its chunk table; recreating it",
+                path.display()
+            );
+            return self.create_region(pos).await;
+        }
+
         // Read and verify magic + version
         let mut header_bytes = [0u8; FILE_HEADER_SIZE];
         file.read_exact(&mut header_bytes).await?;
@@ -185,15 +198,14 @@ impl RegionManager {
             .open(&path)
             .await?;
 
-        // Write header
-        let mut header_bytes = [0u8; FILE_HEADER_SIZE];
-        header_bytes[0..4].copy_from_slice(&REGION_MAGIC);
-        header_bytes[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        file.write_all(&header_bytes).await?;
-
-        // Write empty chunk table
+        // The file header and the empty chunk table, in one write.
         let header = RegionHeader::new();
-        file.write_all(&header.to_bytes()).await?;
+        let mut header_bytes = Vec::with_capacity(FILE_HEADER_SIZE + CHUNK_TABLE_SIZE);
+        header_bytes.extend_from_slice(&REGION_MAGIC);
+        header_bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        header_bytes.resize(FILE_HEADER_SIZE, 0);
+        header_bytes.extend_from_slice(&header.to_bytes());
+        file.write_all(&header_bytes).await?;
         file.flush().await?;
 
         Ok(RegionHandle {
@@ -1484,6 +1496,48 @@ mod tests {
         assert_eq!(
             open_region_entry(&manager, other).await.sector_offset,
             failed_copy
+        );
+        fs::remove_dir_all(directory)
+            .await
+            .expect("test directory should be removable");
+    }
+
+    #[tokio::test]
+    async fn region_left_short_by_a_crash_during_creation_is_recreated() {
+        let directory = test_directory("short_region");
+        let pos = ChunkPos::new(2, 3);
+        let region_pos = RegionPos::from_chunk(pos.0.x, pos.0.y);
+        fs::create_dir_all(&directory)
+            .await
+            .expect("test directory should be creatable");
+        let mut file_header = [0u8; FILE_HEADER_SIZE];
+        file_header[0..4].copy_from_slice(&REGION_MAGIC);
+        file_header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        // A crash between writing the file header and the chunk table leaves this behind.
+        fs::write(directory.join(region_pos.filename()), file_header)
+            .await
+            .expect("short region should be writable");
+
+        let manager = RegionManager::new(&directory);
+        assert!(
+            !manager
+                .acquire_chunk(pos)
+                .await
+                .expect("a short region holds no chunks and should be recreated")
+        );
+        let saved = manager
+            .save_chunk_data(saved_chunk(pos, 1), &test_thread_pool())
+            .await;
+        assert!(matches!(saved, Ok(true)));
+        manager
+            .release_chunk(pos)
+            .await
+            .expect("region should close");
+        assert!(
+            RegionManager::new(&directory)
+                .chunk_exists(pos)
+                .await
+                .expect("header should be readable")
         );
         fs::remove_dir_all(directory)
             .await
