@@ -82,8 +82,8 @@ impl UnopenedRegion {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::Absent),
             Err(error) => return Err(error),
         };
-        // `open_region` starts over a file too short for its chunk table (its creation was cut
-        // short), so it holds no chunks.
+        // Chunk data starts after the chunk table, so a file too short to hold the table (as a
+        // crash while creating it leaves) holds no chunks.
         if file.metadata()?.len() < (FILE_HEADER_SIZE + CHUNK_TABLE_SIZE) as u64 {
             return Ok(Self::Absent);
         }
@@ -729,9 +729,10 @@ impl RegionManager {
     /// Reads one saved chunk's compressed payload while holding the region lock, so no save
     /// can move it mid-read.
     ///
-    /// An open region is read through its handle, since its on-disk chunk table is only
-    /// rewritten when it closes. Otherwise the table on disk is current, and this chunk's entry
-    /// is re-read from it through the call's read-only handle in `unopened`.
+    /// An open region is read through its handle, whose in-memory chunk table is authoritative
+    /// while the region is open; the table on disk can lag behind it. Otherwise the table on
+    /// disk is current, and this chunk's entry is re-read from it through the call's read-only
+    /// handle in `unopened`.
     async fn read_saved_chunk(
         &self,
         pos: ChunkPos,
@@ -1154,7 +1155,7 @@ mod tests {
         let other_region_pos = RegionPos::from_chunk(other_region.0.x, other_region.0.y);
         assert!(!directory.join(other_region_pos.filename()).exists());
 
-        // A save into an open region only updates its in-memory chunk table until it closes.
+        // A save into an open region is read through the region's in-memory chunk table.
         assert!(
             manager
                 .acquire_chunk(saved)
