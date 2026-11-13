@@ -7,6 +7,7 @@ pub mod float_consts;
 /// Math utilities used by vanilla world generation noise.
 mod noise_math;
 mod rounding;
+mod sequence;
 pub mod trig;
 /// Vanilla `Vec3` axis rotations.
 pub mod vector;
@@ -17,3 +18,4 @@ pub use crate::angle::{
 };
 pub use crate::noise_math::*;
 pub use crate::rounding::round_f32;
+pub use crate::sequence::{OutFromOrigin, out_from_origin};

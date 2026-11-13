@@ -1,22 +1,18 @@
-//! Structure location command.
+//! `/locate structure`.
 
 use std::{sync::Arc, time::Instant};
 
 use steel_utils::{BlockPos, Identifier, translations};
-use text_components::{
-    Modifier, TextComponent,
-    format::Color,
-    interactivity::{ClickEvent, HoverEvent},
-};
+use text_components::TextComponent;
 
-use super::super::{
-    brigadier::{CommandNodeBuilder, CommandSyntaxError},
+use super::super::super::{
+    brigadier::CommandSyntaxError,
     execution::{
-        CommandResultSuspension, CommandResultSuspensionPoll, CommandSource, SteelArgumentType,
-        SteelCommandContext, SteelCommandRuntime, StructureOrTagKey, argument, literal,
+        CommandResultSuspension, CommandResultSuspensionPoll, CommandSource, SteelCommandContext,
+        StructureOrTagKey,
     },
-    registration::CommandRegistration,
 };
+use super::show_locate_result;
 use crate::{
     chunk::{
         chunk_request::{ChunkRequest, ChunkRequestHandle, ChunkRequestState, ChunkTicketKind},
@@ -31,22 +27,7 @@ use crate::{
 
 const MAX_STRUCTURE_SEARCH_RADIUS: i32 = 100;
 
-pub(super) fn registration() -> CommandRegistration<CommandSource> {
-    CommandRegistration::new(Identifier::vanilla_static("locate"), |_| command())
-}
-
-fn command() -> CommandNodeBuilder<CommandSource, SteelCommandRuntime> {
-    literal("locate").then(
-        literal("structure").then(
-            argument("structure", SteelArgumentType::structure_or_tag_key())
-                .executes_suspended(start_structure_search),
-        ),
-    )
-    // TODO: Add `locate biome` once Steel has an asynchronous closest-biome search.
-    // TODO: Add `locate poi` once Steel has a point-of-interest manager.
-}
-
-fn start_structure_search(
+pub(super) fn start_search(
     context: &SteelCommandContext<CommandSource>,
 ) -> Result<LocateStructureSearch, CommandSyntaxError> {
     let query = context.structure_or_tag_key("structure")?;
@@ -105,7 +86,7 @@ struct LocatedStructure {
     distance_sqr: i64,
 }
 
-struct LocateStructureSearch {
+pub(super) struct LocateStructureSearch {
     source: CommandSource,
     world: Arc<World>,
     query: StructureOrTagKey,
@@ -300,17 +281,14 @@ impl LocateStructureSearch {
         let Some(best) = &self.best else {
             return CommandResultSuspensionPoll::Ready(Err(structure_not_found(&self.query)));
         };
-        let pos = best.candidate.locate_pos;
-        let distance = horizontal_distance(self.origin, pos);
-        let structure_name = self.query.found_name(&best.found_structure);
-        self.source.send_success(
-            &locate_success_component(structure_name.clone(), pos, distance),
+        let distance = show_locate_result(
+            &self.source,
+            self.origin,
+            best.candidate.locate_pos,
+            &translations::COMMANDS_LOCATE_STRUCTURE_SUCCESS,
             false,
-        );
-        tracing::info!(
-            "Locating element {} took {} ms",
-            structure_name,
-            self.started_at.elapsed().as_millis()
+            &self.query.found_name(&best.found_structure),
+            self.started_at.elapsed(),
         );
         CommandResultSuspensionPoll::Ready(Ok(distance))
     }
@@ -342,126 +320,4 @@ fn structure_not_found(query: &StructureOrTagKey) -> CommandSyntaxError {
             .message([TextComponent::from(query.as_printable())])
             .component(),
     )
-}
-
-fn horizontal_distance(a: BlockPos, b: BlockPos) -> i32 {
-    let dx = b.0.x.wrapping_sub(a.0.x);
-    let dz = b.0.z.wrapping_sub(a.0.z);
-    let squared = dx.wrapping_mul(dx).wrapping_add(dz.wrapping_mul(dz));
-    (f64::from(squared as f32).sqrt() as f32).floor() as i32
-}
-
-fn locate_success_component(structure_name: String, pos: BlockPos, distance: i32) -> TextComponent {
-    translations::COMMANDS_LOCATE_STRUCTURE_SUCCESS
-        .message([
-            TextComponent::from(structure_name),
-            locate_coordinates_component(pos),
-            TextComponent::from(distance.to_string()),
-        ])
-        .component()
-}
-
-fn locate_coordinates_component(pos: BlockPos) -> TextComponent {
-    let displayed_y = "~";
-    TextComponent::plain("[")
-        .add_child(
-            translations::CHAT_COORDINATES
-                .message([
-                    TextComponent::from(pos.0.x.to_string()),
-                    TextComponent::from(displayed_y),
-                    TextComponent::from(pos.0.z.to_string()),
-                ])
-                .component(),
-        )
-        .add_child(TextComponent::plain("]"))
-        .color(Color::Green)
-        .hover_event(HoverEvent::show_text(
-            &translations::CHAT_COORDINATES_TOOLTIP,
-        ))
-        .click_event(ClickEvent::suggest_command(format!(
-            "/tp @s {} {} {}",
-            pos.0.x, displayed_y, pos.0.z
-        )))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::create_dispatcher;
-    use super::*;
-    use crate::command::{
-        brigadier::{CommandDispatcher, NodeId},
-        execution::SteelCommandRuntime,
-    };
-    use steel_registry::init_vanilla_registry;
-
-    type Dispatcher = CommandDispatcher<CommandSource, SteelCommandRuntime>;
-
-    fn child(dispatcher: &Dispatcher, parent: NodeId, name: &str) -> NodeId {
-        let Some(children) = dispatcher.children(parent) else {
-            panic!("parent node should exist");
-        };
-        let Some(child) = children.iter().copied().find(|child| {
-            dispatcher
-                .node(*child)
-                .is_some_and(|node| node.name() == name)
-        }) else {
-            panic!("child {name} should exist");
-        };
-        child
-    }
-
-    #[test]
-    fn locate_graph_exposes_only_the_supported_typed_structure_branch() {
-        init_vanilla_registry();
-        let Ok(dispatcher) = create_dispatcher() else {
-            panic!("built-in commands should register");
-        };
-        let locate = child(&dispatcher, dispatcher.root(), "locate");
-        let structure = child(&dispatcher, locate, "structure");
-        let target = child(&dispatcher, structure, "structure");
-
-        assert_eq!(
-            dispatcher
-                .node(target)
-                .and_then(|node| node.argument_type()),
-            Some(&SteelArgumentType::structure_or_tag_key())
-        );
-        let Some(target_node) = dispatcher.node(target) else {
-            panic!("locate structure argument should exist");
-        };
-        assert!(target_node.is_executable());
-        assert!(dispatcher.children(target).is_some_and(<[_]>::is_empty));
-        assert_eq!(dispatcher.children(locate).map(<[_]>::len), Some(1));
-    }
-
-    #[test]
-    fn locate_coordinates_component_matches_vanilla_interactivity() {
-        let component = locate_coordinates_component(BlockPos::new(12, 0, -34));
-
-        assert_eq!(component.format.color, Some(Color::Green));
-        assert!(matches!(
-            component.interactions.click,
-            Some(ClickEvent::SuggestCommand { ref command })
-                if command.as_ref() == "/tp @s 12 ~ -34"
-        ));
-        assert!(matches!(
-            component.interactions.hover,
-            Some(HoverEvent::ShowText { .. })
-        ));
-    }
-
-    #[test]
-    fn horizontal_distance_matches_vanillas_wrapping_int_and_float_math() {
-        assert_eq!(
-            horizontal_distance(BlockPos::new(0, 0, 0), BlockPos::new(3, 100, 4)),
-            5
-        );
-        assert_eq!(
-            horizontal_distance(
-                BlockPos::new(-30_000_000, 0, 0),
-                BlockPos::new(30_000_000, 0, 0)
-            ),
-            36_907
-        );
-    }
 }
