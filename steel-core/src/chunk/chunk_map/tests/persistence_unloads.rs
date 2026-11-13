@@ -3,6 +3,7 @@ use crate::chunk::chunk_holder::ChunkSavePreparationGuard;
 use crate::chunk::chunk_pyramid::GENERATION_PYRAMID;
 use crate::chunk::chunk_request::{ChunkRequest, ChunkTicketKind};
 use std::thread;
+use steel_registry::{RegistryEntry, vanilla_poi_types};
 
 /// Unloads a ready Full holder at `pos` and reserves its save preparation.
 fn unloading_holder_with_save_preparation(
@@ -332,4 +333,82 @@ fn gameplay_cache_scopes_observe_a_full_holder_revived_between_phases() {
     assert_eq!(gameplay_scope.finish().missing_hits, 0);
     drop(request);
     stop_chunk_tasks(world);
+}
+
+/// Registers a claimed `home` POI so the test can tell persisted ticket state from a rescan.
+fn add_claimed_home_poi(world: &World, pos: BlockPos) -> usize {
+    let home = vanilla_poi_types::HOME
+        .try_id()
+        .expect("vanilla home POI type should be registered");
+    let mut storage = world.poi_storage.lock();
+    storage.add(pos, home, 1);
+    assert!(
+        storage.reserve_ticket(pos),
+        "a fresh home POI has one free ticket"
+    );
+    home
+}
+
+#[test]
+fn unloading_full_chunk_keeps_pois_for_its_save_and_revival() {
+    init_vanilla_registry();
+    init_behaviors();
+    let world_fixture = fresh_test_world("poi_unload_save_revival");
+    let world = &world_fixture.world;
+    let chunk_pos = ChunkPos::new(0, 0);
+    let poi_pos = BlockPos::new(1, 64, 1);
+    let original = insert_ready_full_chunk(world, chunk_pos);
+    let home = add_claimed_home_poi(world, poi_pos);
+
+    world.chunk_map.update_chunk_level(chunk_pos, None);
+    assert!(world.chunk_map.unloading_chunks.contains_sync(&chunk_pos));
+
+    let Some(chunk) = original.try_chunk(ChunkStatus::Full) else {
+        panic!("unloading test chunk must remain Full");
+    };
+    let Some(prepared) = ChunkStorage::prepare_chunk_save(chunk, ChunkStatus::Full, &[], true)
+    else {
+        panic!("a forced save of the unloading chunk should be prepared");
+    };
+    let saved: Vec<_> = prepared
+        .persistent
+        .pois
+        .iter()
+        .map(|poi| (poi.x, poi.y, poi.z, poi.free_tickets))
+        .collect();
+    assert_eq!(
+        saved,
+        [(1, 64, 1, 0)],
+        "the unload save must keep the claimed ticket"
+    );
+
+    let revived = revive_at_full(world, chunk_pos);
+    assert!(Arc::ptr_eq(&original, &revived));
+    assert_eq!(world.poi_storage.lock().get_type(poi_pos), Some(home));
+    assert!(world.poi_storage.lock().is_occupied(poi_pos));
+}
+
+#[test]
+fn final_full_chunk_unload_drops_chunk_pois() {
+    init_vanilla_registry();
+    init_behaviors();
+    let world_fixture = fresh_test_world("poi_final_unload");
+    let world = &world_fixture.world;
+    let chunk_pos = ChunkPos::new(0, 0);
+    let poi_pos = BlockPos::new(1, 64, 1);
+    let holder = insert_ready_full_chunk(world, chunk_pos);
+    add_claimed_home_poi(world, poi_pos);
+    let Some(chunk) = holder.try_full_chunk() else {
+        panic!("inserted test chunk must remain Full");
+    };
+    chunk.common().take_dirty();
+
+    world.chunk_map.update_chunk_level(chunk_pos, None);
+    world.chunk_map.rebuild_ticking_chunk_snapshot();
+    drop(holder);
+    let _runtime_guard = world.chunk_map.chunk_runtime.enter();
+    world.chunk_map.process_unloads();
+
+    assert!(!world.chunk_map.unloading_chunks.contains_sync(&chunk_pos));
+    assert_eq!(world.poi_storage.lock().get_type(poi_pos), None);
 }
