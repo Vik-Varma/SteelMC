@@ -52,6 +52,7 @@ pub(super) fn start_search(
 
     let search_query = query.clone();
     let search_cancelled = Arc::clone(&cancelled);
+    let started_at = Instant::now();
     let task = world.chunk_map.chunk_runtime.spawn(async move {
         let found = columns
             .pois(&storage, &thread_pool, &search_cancelled)
@@ -66,7 +67,7 @@ pub(super) fn start_search(
                 find_closest_with_type(pois, matches, origin, POI_SEARCH_RADIUS)
             });
         // The command may have been cancelled and dropped its receiver.
-        let _ = sender.send(found);
+        let _ = sender.send((found, Instant::now()));
     });
 
     Ok(LocatePoiSearch {
@@ -75,7 +76,7 @@ pub(super) fn start_search(
         origin,
         receiver,
         search: BackgroundSearch { task, cancelled },
-        started_at: Instant::now(),
+        started_at,
     })
 }
 
@@ -83,7 +84,8 @@ pub(super) struct LocatePoiSearch {
     source: CommandSource,
     query: PoiTypeOrTag,
     origin: BlockPos,
-    receiver: oneshot::Receiver<io::Result<Option<SavedPoi>>>,
+    /// The search's result and when the background task finished it.
+    receiver: oneshot::Receiver<(io::Result<Option<SavedPoi>>, Instant)>,
     search: BackgroundSearch,
     started_at: Instant,
 }
@@ -111,9 +113,9 @@ impl Drop for BackgroundSearch {
 
 impl CommandResultSuspension for LocatePoiSearch {
     fn poll(&mut self) -> CommandResultSuspensionPoll {
-        let found = match self.receiver.try_recv() {
-            Ok(Ok(found)) => found,
-            Ok(Err(error)) => {
+        let (found, finished_at) = match self.receiver.try_recv() {
+            Ok((Ok(found), finished_at)) => (found, finished_at),
+            Ok((Err(error), _)) => {
                 return CommandResultSuspensionPoll::Ready(Err(CommandSyntaxError::dynamic(
                     format!("POI search failed: {error}"),
                 )));
@@ -137,7 +139,8 @@ impl CommandResultSuspension for LocatePoiSearch {
             &translations::COMMANDS_LOCATE_POI_SUCCESS,
             false,
             &self.query.found_name(poi_type),
-            self.started_at.elapsed(),
+            // Up to the search finishing, not this later poll.
+            finished_at.saturating_duration_since(self.started_at),
         );
         CommandResultSuspensionPoll::Ready(Ok(distance))
     }
