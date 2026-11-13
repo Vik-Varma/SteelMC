@@ -206,7 +206,7 @@ const fn section_offset(origin: BlockPos, index: usize) -> BlockPos {
 #[cfg(test)]
 mod tests {
     use std::{
-        io,
+        env, fs, io, process,
         sync::{Arc, atomic::AtomicBool},
         time::Duration,
     };
@@ -218,11 +218,12 @@ mod tests {
         time::{sleep, timeout},
     };
 
-    use super::super::ChunkStorage;
+    use super::super::{ChunkStorage, RegionManager};
     use crate::{
         behavior::init_behaviors,
         block_entity::init_block_entities,
         chunk::status::ChunkStatus,
+        poi::PoiSquareColumns,
         test_support::{block_pool, fresh_test_world, insert_ready_full_chunk},
     };
 
@@ -320,5 +321,71 @@ mod tests {
                 "a cancelled scan must end without waiting for the pool"
             );
         });
+    }
+
+    #[test]
+    fn poi_positions_survive_the_in_memory_scan_and_a_real_region_round_trip() {
+        steel_registry::init_vanilla_registry();
+        init_behaviors();
+        init_block_entities();
+        let world_fixture = fresh_test_world("poi-region-round-trip");
+        let world = &world_fixture.world;
+        // Negative block x and asymmetric local coordinates catch swapped or dropped axes; the
+        // two heights land in the bottom section and a higher one.
+        let chunk_pos = ChunkPos::new(-3, 2);
+        let holder = insert_ready_full_chunk(world, chunk_pos);
+        let low = BlockPos::new(-34, -50, 34);
+        let high = BlockPos::new(-47, 70, 41);
+        for pos in [low, high] {
+            assert!(world.set_block(
+                pos,
+                vanilla_blocks::LODESTONE.default_state(),
+                UpdateFlags::UPDATE_ALL,
+            ));
+        }
+        let lodestone = vanilla_poi_types::LODESTONE
+            .try_id()
+            .expect("vanilla lodestone POI type should be registered");
+        let expected = vec![(low, lodestone), (high, lodestone)];
+        let (min_y, height) = (world.get_min_y(), world.get_height());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("test pool should build");
+        let not_cancelled = Arc::new(AtomicBool::new(false));
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should start");
+
+        let columns = PoiSquareColumns::capture(&world.chunk_map, high, 0);
+        let in_memory = runtime
+            .block_on(columns.pois(&world.chunk_map.storage, &pool, &not_cancelled))
+            .expect("the in-memory scan should succeed");
+        assert_eq!(in_memory, expected);
+
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Full) else {
+            panic!("inserted chunk should be Full");
+        };
+        let Some(prepared) = ChunkStorage::prepare_chunk_save(chunk, ChunkStatus::Full, &[], true)
+        else {
+            panic!("a forced save should be prepared");
+        };
+        let directory =
+            env::temp_dir().join(format!("steel-poi-region-round-trip-{}", process::id()));
+        let disk = ChunkStorage::Disk(RegionManager::new(&directory));
+        let read = runtime.block_on(async {
+            assert!(matches!(
+                disk.save_chunk_data(prepared, &pool).await,
+                Ok(true)
+            ));
+            disk.saved_chunk_pois(&[chunk_pos], min_y, height, &pool, &not_cancelled)
+                .await
+        });
+        let _ = fs::remove_dir_all(&directory);
+        let Ok(read) = read else {
+            panic!("the saved chunk should be read back");
+        };
+        assert_eq!(read, [(chunk_pos, expected)]);
     }
 }
