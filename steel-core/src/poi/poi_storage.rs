@@ -151,8 +151,11 @@ impl PointOfInterestStorage {
     }
 
     /// Reserves a ticket at the given position. Returns `true` if successful.
+    ///
+    /// Use [`World::reserve_poi_ticket`](crate::world::World::reserve_poi_ticket), which also
+    /// marks the chunk for saving.
     #[must_use]
-    pub fn reserve_ticket(&mut self, pos: BlockPos) -> bool {
+    pub(super) fn reserve_ticket(&mut self, pos: BlockPos) -> bool {
         let (chunk_pos, section_y, packed) = resolve_pos(pos);
         let Some(set) = self
             .columns
@@ -168,8 +171,11 @@ impl PointOfInterestStorage {
     }
 
     /// Releases a ticket at the given position. Returns `true` if successful.
+    ///
+    /// Use [`World::release_poi_ticket`](crate::world::World::release_poi_ticket), which also
+    /// marks the chunk for saving.
     #[must_use]
-    pub fn release_ticket(&mut self, pos: BlockPos) -> bool {
+    pub(super) fn release_ticket(&mut self, pos: BlockPos) -> bool {
         let (chunk_pos, section_y, packed) = resolve_pos(pos);
         let Some(set) = self
             .columns
