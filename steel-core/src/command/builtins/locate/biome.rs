@@ -27,7 +27,8 @@ const MAX_BIOME_SEARCH_RADIUS: i32 = 6400;
 const BIOME_SAMPLE_RESOLUTION_HORIZONTAL: i32 = 32;
 const BIOME_SAMPLE_RESOLUTION_VERTICAL: i32 = 64;
 
-type SearchResult = Option<(BlockPos, BiomeRef)>;
+/// The search's result and when the worker finished it.
+type SearchResult = (Option<(BlockPos, BiomeRef)>, Instant);
 
 /// Starts the search on the server's locate search pool.
 ///
@@ -46,6 +47,7 @@ pub(super) fn start_search(
     let cancelled = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = oneshot::channel();
 
+    let started_at = Instant::now();
     let search_query = query.clone();
     let search_cancelled = Arc::clone(&cancelled);
     source.server().locate_search_pool.spawn(move || {
@@ -60,7 +62,7 @@ pub(super) fn start_search(
             &search_cancelled,
         );
         // The command may have been cancelled and dropped its receiver.
-        let _ = sender.send(found);
+        let _ = sender.send((found, Instant::now()));
     });
 
     Ok(LocateBiomeSearch {
@@ -69,7 +71,7 @@ pub(super) fn start_search(
         origin,
         receiver,
         cancelled,
-        started_at: Instant::now(),
+        started_at,
     })
 }
 
@@ -85,7 +87,7 @@ pub(super) struct LocateBiomeSearch {
 impl CommandResultSuspension for LocateBiomeSearch {
     fn poll(&mut self) -> CommandResultSuspensionPoll {
         match self.receiver.try_recv() {
-            Ok(Some((pos, biome))) => {
+            Ok((Some((pos, biome)), finished_at)) => {
                 let distance = show_locate_result(
                     &self.source,
                     self.origin,
@@ -93,11 +95,12 @@ impl CommandResultSuspension for LocateBiomeSearch {
                     &translations::COMMANDS_LOCATE_BIOME_SUCCESS,
                     true,
                     &self.query.found_name(biome),
-                    self.started_at.elapsed(),
+                    // Up to the worker finishing, not this later poll.
+                    finished_at.saturating_duration_since(self.started_at),
                 );
                 CommandResultSuspensionPoll::Ready(Ok(distance))
             }
-            Ok(None) => CommandResultSuspensionPoll::Ready(Err(biome_not_found(&self.query))),
+            Ok((None, _)) => CommandResultSuspensionPoll::Ready(Err(biome_not_found(&self.query))),
             Err(TryRecvError::Empty) => CommandResultSuspensionPoll::Pending,
             Err(TryRecvError::Closed) => CommandResultSuspensionPoll::Ready(Err(
                 CommandSyntaxError::dynamic("Biome search ended without a result"),
