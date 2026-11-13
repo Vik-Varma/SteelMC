@@ -172,7 +172,7 @@ fn configured_chunk_encoding_threads(configured_threads: Option<usize>) -> Optio
     cap_positive_thread_count(configured_threads, available_worker_threads())
 }
 
-/// Builds the pool `/locate biome` and `/locate poi` search on.
+/// Builds the pool `/locate` searches run on.
 ///
 /// A biome search that finds nothing samples about a million climate points, so searches stay
 /// off the shared chunk generation pool. Their jobs queue on one thread, as vanilla runs
@@ -521,7 +521,7 @@ pub struct Server {
     packet_processor: PacketProcessor,
     /// Dedicated worker pool for CPU-heavy chunk persistence and packet encoding.
     chunk_encoding_pool: Arc<ThreadPool>,
-    /// Worker pool for `/locate` biome and POI searches.
+    /// Worker pool for `/locate` searches.
     pub(crate) locate_search_pool: Arc<ThreadPool>,
     /// Jobs resumed from a known point in the server game tick.
     pub jobs: ServerJobQueue,

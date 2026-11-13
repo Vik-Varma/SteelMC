@@ -4539,7 +4539,7 @@ fn title_command_delivers_vanilla_packets_to_recorded_connections() {
 }
 
 #[test]
-fn locate_biome_command_finishes_from_the_generation_pool_with_vanilla_distances() {
+fn locate_biome_command_finishes_in_the_background_with_vanilla_distances() {
     use steel_registry::init_vanilla_registry;
 
     init_vanilla_registry();
