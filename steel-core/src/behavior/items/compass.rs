@@ -17,6 +17,7 @@ use text_components::TextComponent;
 
 use crate::behavior::{InteractionResult, InventoryTickContext, ItemBehavior, UseOnContext};
 use crate::inventory::container::Container;
+use crate::poi::UnloadedPoi;
 
 use super::dynamic_name::{default_name, translated};
 
@@ -101,13 +102,19 @@ impl ItemBehavior for CompassItem {
 
         let pos = target.pos();
         if world.is_in_world_bounds(pos) {
-            // TODO: validate unloaded targets once POI persistence exists.
-            if !world.is_full_chunk_loaded_at(pos) {
-                return;
-            }
+            let poi_type = if world.is_full_chunk_loaded_at(pos) {
+                world.poi_storage.lock().get_type(pos)
+            } else {
+                // Vanilla reads the target's POI data from disk. Steel reads the chunk in the
+                // background and keeps the target until the answer arrives.
+                let UnloadedPoi::Known(poi_type) = world.unloaded_poi_type_at(pos) else {
+                    return;
+                };
+                poi_type
+            };
             let lodestone_exists = vanilla_poi_types::LODESTONE
                 .try_id()
-                .is_some_and(|id| world.poi_storage.lock().get_type(pos) == Some(id));
+                .is_some_and(|id| poi_type == Some(id));
             if lodestone_exists {
                 return;
             }
@@ -119,12 +126,19 @@ impl ItemBehavior for CompassItem {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::Arc,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use super::*;
     use crate::behavior::init_behaviors;
     use crate::entity::{Entity, LivingEntity};
-    use crate::test_support::{TestPlayerBuilder, fresh_test_world, insert_ready_full_chunk};
+    use crate::player::Player;
+    use crate::test_support::{
+        TestPlayerBuilder, block_pool, fresh_test_world, insert_ready_full_chunk,
+    };
     use glam::DVec3;
     use steel_registry::blocks::properties::Direction;
     use steel_registry::items::item::BlockHitResult;
@@ -242,5 +256,125 @@ mod tests {
             tracker.target().is_none(),
             "target should be immediately invalidated and set to None"
         );
+    }
+
+    /// Ticks `player` until the selected compass's target is `expected`, failing after a few
+    /// seconds. The compass checks unloaded targets in the background.
+    fn tick_until_target(player: &Arc<Player>, expected: Option<BlockPos>) {
+        let started = Instant::now();
+        loop {
+            Arc::clone(player).tick();
+            let target = player
+                .inventory
+                .lock()
+                .get_selected_item()
+                .get(LODESTONE_TRACKER)
+                .and_then(|tracker| tracker.target().map(GlobalPos::pos));
+            if target == expected {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the target stayed {target:?}, expected {expected:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn compass_checks_targets_in_unloaded_chunks_against_their_save() {
+        use crate::block_entity::init_block_entities;
+        use crate::chunk::status::ChunkStatus;
+        use crate::chunk_saver::ChunkStorage;
+
+        init_vanilla_registry();
+        init_behaviors();
+        init_block_entities();
+        let world_fixture = fresh_test_world("compass_unloaded_target");
+        let world = &world_fixture.world;
+
+        // Save a chunk holding a lodestone, then unload it.
+        let saved_chunk = ChunkPos::new(2, 0);
+        let lodestone = BlockPos::new(40, 70, 2);
+        let holder = insert_ready_full_chunk(world, saved_chunk);
+        assert!(world.set_block(
+            lodestone,
+            vanilla_blocks::LODESTONE.default_state(),
+            UpdateFlags::UPDATE_ALL
+        ));
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Full) else {
+            panic!("inserted chunk should be Full");
+        };
+        let Some(prepared) = ChunkStorage::prepare_chunk_save(chunk, ChunkStatus::Full, &[], true)
+        else {
+            panic!("a forced save should be prepared");
+        };
+        let saved = world.chunk_map.chunk_runtime.block_on(
+            world
+                .chunk_map
+                .storage
+                .save_chunk_data(prepared, &world.chunk_map.generation_pool),
+        );
+        assert!(matches!(saved, Ok(true)));
+        let _ = world.chunk_map.chunks.remove_sync(&saved_chunk);
+        world.poi_storage.lock().remove_chunk(saved_chunk);
+        drop(holder);
+        assert!(!world.is_full_chunk_loaded_at(lodestone));
+
+        let player = TestPlayerBuilder::new(Arc::clone(world), "CompassTester", 1)
+            .uuid(Uuid::from_u128(1))
+            .build();
+        let compass_for = |target: BlockPos| {
+            let mut compass = ItemStack::new(&vanilla_items::COMPASS);
+            compass.set(
+                LODESTONE_TRACKER,
+                LodestoneTracker::new(Some(GlobalPos::new(world.key.clone(), target)), true),
+            );
+            compass
+        };
+
+        // The saved lodestone keeps its compass, both while the chunk is read and after.
+        player
+            .inventory
+            .lock()
+            .set_selected_item(compass_for(lodestone));
+        {
+            // Hold the read back so these ticks find it still running.
+            let _blocked = block_pool(&world.chunk_map.generation_pool);
+            for _ in 0..5 {
+                tick_until_target(&player, Some(lodestone));
+            }
+        }
+        for _ in 0..20 {
+            tick_until_target(&player, Some(lodestone));
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // No lodestone is saved at this position of the same chunk.
+        let beside = BlockPos::new(41, 70, 2);
+        player
+            .inventory
+            .lock()
+            .set_selected_item(compass_for(beside));
+        Arc::clone(&player).tick();
+        let kept = player
+            .inventory
+            .lock()
+            .get_selected_item()
+            .get(LODESTONE_TRACKER)
+            .and_then(|tracker| tracker.target().map(GlobalPos::pos));
+        assert_eq!(
+            kept,
+            Some(beside),
+            "the target is kept until the read finishes"
+        );
+        tick_until_target(&player, None);
+
+        // A chunk that was never saved holds no lodestone.
+        player
+            .inventory
+            .lock()
+            .set_selected_item(compass_for(BlockPos::new(85, 70, 2)));
+        tick_until_target(&player, None);
     }
 }

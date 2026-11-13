@@ -65,6 +65,18 @@ impl PoiSquareColumns {
         }
     }
 
+    /// Captures the one chunk at `chunk_pos`.
+    #[must_use]
+    pub fn single(chunk_map: &Arc<ChunkMap>, chunk_pos: ChunkPos) -> Self {
+        let holder = current_holder(chunk_map, chunk_pos).map(|holder| Arc::downgrade(&holder));
+        Self {
+            columns: vec![(chunk_pos, holder)],
+            chunk_map: Arc::downgrade(chunk_map),
+            min_y: chunk_map.world_gen_context.min_y(),
+            height: chunk_map.world_gen_context.height(),
+        }
+    }
+
     /// Lists every POI in the captured chunks: chunks in capture order, then sections from
     /// the bottom, then y, z, x within a section.
     ///
