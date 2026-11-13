@@ -65,7 +65,7 @@
         },
         "config": {
           "type": "object",
-          "description": "Storage-specific config. steel:disk supports an optional relative path and sync_writes (default true: each region file write waits until it is on disk, like vanilla's sync-chunk-writes; false is faster but a power loss or OS crash can lose recent saves); steel:ram accepts no keys.",
+          "description": "Storage-specific config. steel:disk supports an optional relative path and sync_writes (default true: each region file write waits until it is on disk, like vanilla's sync-chunk-writes; false is faster, but after a power loss or OS crash a region file can become unreadable or load the wrong chunk data); steel:ram accepts no keys.",
           "additionalProperties": true
         }
       },
