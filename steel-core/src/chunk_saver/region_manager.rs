@@ -82,6 +82,11 @@ impl UnopenedRegion {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::Absent),
             Err(error) => return Err(error),
         };
+        // `open_region` starts over a file too short for its chunk table (its creation was cut
+        // short), so it holds no chunks.
+        if file.metadata()?.len() < (FILE_HEADER_SIZE + CHUNK_TABLE_SIZE) as u64 {
+            return Ok(Self::Absent);
+        }
         let mut file_header = [0u8; FILE_HEADER_SIZE];
         file.read_exact(&mut file_header)?;
         if file_header[0..4] != REGION_MAGIC {
@@ -1271,6 +1276,26 @@ mod tests {
             fs::read(region_file(&directory)).await.ok().as_deref(),
             Some(bytes.as_slice())
         );
+        fs::remove_dir_all(&directory)
+            .await
+            .expect("test directory should be removable");
+
+        // Too short for a chunk table, as a crash while creating it leaves: no chunks.
+        let directory = test_directory("saved_reads_short_region");
+        fs::create_dir_all(&directory)
+            .await
+            .expect("test directory should be creatable");
+        let mut file_header = [0u8; FILE_HEADER_SIZE];
+        file_header[0..4].copy_from_slice(&REGION_MAGIC);
+        file_header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        fs::write(region_file(&directory), file_header)
+            .await
+            .expect("short region should be written");
+        let manager = RegionManager::new(&directory);
+        let read = manager
+            .read_saved_chunks(&[first, second], &AtomicBool::new(false))
+            .await;
+        assert!(read.is_empty());
         fs::remove_dir_all(&directory)
             .await
             .expect("test directory should be removable");
