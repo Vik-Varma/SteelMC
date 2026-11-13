@@ -74,6 +74,8 @@ pub(super) fn parse_poi_type_or_tag(
     Err(error)
 }
 
+/// Suggests POI types and POI type tags. Like vanilla, tags are only offered for empty input or
+/// input starting with `#`.
 pub(super) fn suggest_poi_types(builder: &mut SuggestionsBuilder<'_>) {
     let remaining = builder.remaining_lowercase();
     let tags = |prefix: &str| {
@@ -87,13 +89,16 @@ pub(super) fn suggest_poi_types(builder: &mut SuggestionsBuilder<'_>) {
     let suggestions = if let Some(tag_prefix) = remaining.strip_prefix('#') {
         tags(tag_prefix)
     } else {
-        REGISTRY
+        let mut poi_types = REGISTRY
             .poi_types
             .iter()
             .filter(|(_, poi_type)| identifier_matches(remaining, &poi_type.key))
             .map(|(_, poi_type)| poi_type.key.to_string())
-            .chain(tags(remaining))
-            .collect()
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            poi_types.extend(tags(remaining));
+        }
+        poi_types
     };
     for suggestion in suggestions {
         builder.suggest(suggestion);

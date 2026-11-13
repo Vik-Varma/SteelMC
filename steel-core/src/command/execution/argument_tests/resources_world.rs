@@ -113,6 +113,25 @@ fn poi_type_or_tag_argument_resolves_registry_entries_and_tags() {
             .iter()
             .any(|suggestion| suggestion.text() == "#minecraft:bee_home")
     );
+
+    // Like vanilla, tags are only offered for empty input or after `#`.
+    let suggested = |input: &str| {
+        let parse = dispatcher.parse(input, TestSource::new());
+        let Ok(suggestions) = dispatcher.completion_suggestions(&parse) else {
+            panic!("POI type suggestions should build");
+        };
+        suggestions
+            .list()
+            .iter()
+            .map(|suggestion| suggestion.text().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let plain = suggested("resource bee");
+    assert!(plain.iter().any(|text| text == "minecraft:bee_nest"));
+    assert!(plain.iter().all(|text| !text.starts_with('#')), "{plain:?}");
+    let empty = suggested("resource ");
+    assert!(empty.iter().any(|text| text == "#minecraft:bee_home"));
+    assert!(empty.iter().any(|text| text == "minecraft:bee_nest"));
 }
 
 #[test]
