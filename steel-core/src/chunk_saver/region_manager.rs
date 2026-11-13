@@ -6,8 +6,9 @@
 
 use std::{
     fmt,
-    io::{self},
-    path::PathBuf,
+    fs::File as StdFile,
+    io::{self, Read as _, Seek as _},
+    path::{Path, PathBuf},
     sync::{
         Weak,
         atomic::{AtomicBool, Ordering},
@@ -20,6 +21,7 @@ use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::oneshot,
+    task,
 };
 
 use crate::chunk::status::ChunkStatus;
@@ -64,6 +66,36 @@ pub struct PreparedChunkSave {
     pub persistent: PersistentChunk<'static>,
     /// Runtime manager entity IDs that were either serialized or explicitly skipped.
     pub handled_runtime_entity_ids: Vec<i32>,
+}
+
+/// A region file `read_saved_chunks` reads without registering it as open.
+enum UnopenedRegion {
+    /// No current-format region file, so no saved chunks.
+    Absent,
+    Readable(StdFile),
+}
+
+impl UnopenedRegion {
+    fn open(path: &Path) -> io::Result<Self> {
+        let mut file = match StdFile::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::Absent),
+            Err(error) => return Err(error),
+        };
+        let mut file_header = [0u8; FILE_HEADER_SIZE];
+        file.read_exact(&mut file_header)?;
+        if file_header[0..4] != REGION_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid region file magic",
+            ));
+        }
+        // `open_region` replaces a region from another format version, so it holds no chunks.
+        if u16::from_le_bytes([file_header[4], file_header[5]]) != FORMAT_VERSION {
+            return Ok(Self::Absent);
+        }
+        Ok(Self::Readable(file))
+    }
 }
 
 /// An open region file with its header.
@@ -653,19 +685,22 @@ impl RegionManager {
     /// Reads the compressed payloads of saved chunks without loading or creating anything.
     ///
     /// Missing chunks are left out. Each chunk is read under its own short hold of the region
-    /// lock, so other chunk I/O can interleave with a long batch. Reading stops early once
+    /// lock, so other chunk I/O can interleave with a long batch. A region that is not open is
+    /// opened read-only once per call; one that does not exist (or has another format version)
+    /// when first needed is treated as empty for the rest of the call. Reading stops early once
     /// `cancelled` is set.
     pub async fn read_saved_chunks(
         &self,
         positions: &[ChunkPos],
         cancelled: &AtomicBool,
     ) -> Vec<(ChunkPos, io::Result<Vec<u8>>)> {
+        let mut unopened = FxHashMap::default();
         let mut saved = Vec::new();
         for &pos in positions {
             if cancelled.load(Ordering::Relaxed) {
                 break;
             }
-            match self.read_saved_chunk(pos).await {
+            match self.read_saved_chunk(pos, &mut unopened).await {
                 Ok(Some(data)) => saved.push((pos, Ok(data))),
                 Ok(None) => {}
                 Err(error) => saved.push((pos, Err(error))),
@@ -678,9 +713,13 @@ impl RegionManager {
     /// can move it mid-read.
     ///
     /// An open region is read through its handle, since its on-disk chunk table is only
-    /// rewritten when it closes. Otherwise the table on disk is current, and only this chunk's
-    /// entry is read from it through a temporary read-only handle.
-    async fn read_saved_chunk(&self, pos: ChunkPos) -> io::Result<Option<Vec<u8>>> {
+    /// rewritten when it closes. Otherwise the table on disk is current, and this chunk's entry
+    /// is re-read from it through the call's read-only handle in `unopened`.
+    async fn read_saved_chunk(
+        &self,
+        pos: ChunkPos,
+        unopened: &mut FxHashMap<RegionPos, UnopenedRegion>,
+    ) -> io::Result<Option<Vec<u8>>> {
         let region_pos = RegionPos::from_chunk(pos.0.x, pos.0.y);
         let (local_x, local_z) = RegionPos::local_chunk_pos(pos.0.x, pos.0.y);
         let index = RegionHeader::chunk_index(local_x, local_z);
@@ -697,28 +736,34 @@ impl RegionManager {
                 .map(Some);
         }
 
-        let mut file = match File::open(self.region_path(region_pos)).await {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
+        let region = if let Some(region) = unopened.remove(&region_pos) {
+            region
+        } else {
+            let path = self.region_path(region_pos);
+            task::spawn_blocking(move || UnopenedRegion::open(&path))
+                .await
+                .map_err(io::Error::other)??
         };
-        let mut file_header = [0u8; FILE_HEADER_SIZE];
-        file.read_exact(&mut file_header).await?;
-        if file_header[0..4] != REGION_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid region file magic",
-            ));
-        }
-        // `open_region` replaces a region from another format version, so it holds no chunks.
-        if u16::from_le_bytes([file_header[4], file_header[5]]) != FORMAT_VERSION {
+        let UnopenedRegion::Readable(mut file) = region else {
+            unopened.insert(region_pos, UnopenedRegion::Absent);
             return Ok(None);
-        }
+        };
+        let (file, data) = task::spawn_blocking(move || {
+            let data = Self::read_unopened_chunk(&mut file, index);
+            (file, data)
+        })
+        .await
+        .map_err(io::Error::other)?;
+        unopened.insert(region_pos, UnopenedRegion::Readable(file));
+        drop(regions);
+        data
+    }
 
-        file.seek(io::SeekFrom::Start((FILE_HEADER_SIZE + index * 8) as u64))
-            .await?;
+    /// Reads chunk table entry `index` and, if it exists, its payload from a region file.
+    fn read_unopened_chunk(file: &mut StdFile, index: usize) -> io::Result<Option<Vec<u8>>> {
+        file.seek(io::SeekFrom::Start((FILE_HEADER_SIZE + index * 8) as u64))?;
         let mut entry_bytes = [0u8; 8];
-        file.read_exact(&mut entry_bytes).await?;
+        file.read_exact(&mut entry_bytes)?;
         let Some(entry) = ChunkEntry::from_bytes(entry_bytes) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -728,10 +773,13 @@ impl RegionManager {
         if !entry.exists() {
             return Ok(None);
         }
-        let file_size = file.seek(io::SeekFrom::End(0)).await?;
-        Self::validate_chunk_entry(entry, file_size.div_ceil(SECTOR_SIZE as u64) as u32)?;
-        let data = Self::read_chunk_data(&mut file, entry.sector_offset, entry.size_bytes).await?;
-        drop(regions);
+        let file_sectors = file.metadata()?.len().div_ceil(SECTOR_SIZE as u64) as u32;
+        Self::validate_chunk_entry(entry, file_sectors)?;
+        file.seek(io::SeekFrom::Start(
+            u64::from(entry.sector_offset) * SECTOR_SIZE as u64,
+        ))?;
+        let mut data = vec![0u8; entry.size_bytes as usize];
+        file.read_exact(&mut data)?;
         Ok(Some(data))
     }
 

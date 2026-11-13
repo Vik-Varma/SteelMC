@@ -11,11 +11,11 @@ use super::{
 const PALETTE_INLINE_CAPACITY: usize = 8;
 
 impl ChunkStorage {
-    fn invalid_chunk_data(message: impl Into<String>) -> io::Error {
+    pub(super) fn invalid_chunk_data(message: impl Into<String>) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, message.into())
     }
 
-    fn validate_packed_palette(
+    pub(super) fn validate_packed_palette(
         palette: &[u16],
         bits_per_entry: u8,
         data: &[u64],
@@ -64,7 +64,7 @@ impl ChunkStorage {
         clippy::too_many_lines,
         reason = "keeps complete chunk payload validation in one ordered pass"
     )]
-    pub(super) fn validate_persistent_chunk(
+    fn validate_persistent_chunk(
         persistent: &PersistentChunk<'_>,
         min_y: i32,
         height: i32,

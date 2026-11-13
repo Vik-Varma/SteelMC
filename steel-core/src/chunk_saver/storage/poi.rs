@@ -135,24 +135,36 @@ impl ChunkStorage {
 
     /// Lists a saved chunk's POI blocks: sections from the bottom, then y, z, x within each.
     ///
-    /// Only sections whose palette holds a POI state are unpacked.
+    /// Only sections whose palette holds a POI state are unpacked, and only what the scan reads
+    /// is validated: the section count, each palette entry as it is resolved, and the packing
+    /// of the unpacked sections. Loading validates the whole chunk, so a chunk damaged only
+    /// elsewhere (other sections, biomes, block entities) is still scanned here although
+    /// loading it would discard it.
     fn persistent_pois(
         persistent: &PersistentChunk<'_>,
         chunk_pos: ChunkPos,
         min_y: i32,
         height: i32,
     ) -> io::Result<Vec<SavedPoi>> {
-        Self::validate_persistent_chunk(persistent, min_y, height)?;
+        let expected_sections = usize::try_from(height / 16).unwrap_or_default();
+        if persistent.sections.len() != expected_sections {
+            return Err(Self::invalid_chunk_data(format!(
+                "chunk has {} sections, expected {expected_sections}",
+                persistent.sections.len()
+            )));
+        }
 
         let mut palette_types: Vec<Option<Option<usize>>> =
             vec![None; persistent.block_states.len()];
         let mut poi_type_at = |index: u16| -> io::Result<Option<usize>> {
-            if let Some(poi_type) = palette_types[usize::from(index)] {
+            let slot = usize::from(index);
+            if let Some(&Some(poi_type)) = palette_types.get(slot) {
                 return Ok(poi_type);
             }
+            // Fails for an index outside the chunk palette, so `slot` is in range below.
             let state = Self::resolve_block_state(persistent, index)?;
             let poi_type = REGISTRY.poi_types.type_id_for_state(state);
-            palette_types[usize::from(index)] = Some(poi_type);
+            palette_types[slot] = Some(poi_type);
             Ok(poi_type)
         };
 
@@ -184,6 +196,14 @@ impl ChunkStorage {
                     if section_types.iter().all(Option::is_none) {
                         continue;
                     }
+                    Self::validate_packed_palette(
+                        palette,
+                        *bits_per_entry,
+                        block_data,
+                        4096,
+                        persistent.block_states.len(),
+                        "block-state",
+                    )?;
                     let indices = unpack_indices(block_data, *bits_per_entry).take(4096);
                     for (index, palette_index) in indices.enumerate() {
                         if let Some(poi_type) = section_types[palette_index as usize] {
@@ -218,7 +238,7 @@ mod tests {
         time::{sleep, timeout},
     };
 
-    use super::super::{ChunkStorage, RegionManager};
+    use super::super::{ChunkStorage, PersistentSection, RegionManager};
     use crate::{
         behavior::init_behaviors,
         block_entity::init_block_entities,
@@ -387,5 +407,49 @@ mod tests {
             panic!("the saved chunk should be read back");
         };
         assert_eq!(read, [(chunk_pos, expected)]);
+    }
+
+    #[test]
+    fn damaged_packing_in_a_poi_section_rejects_the_chunk() {
+        steel_registry::init_vanilla_registry();
+        init_behaviors();
+        init_block_entities();
+        let world_fixture = fresh_test_world("poi-damaged-section");
+        let world = &world_fixture.world;
+        let chunk_pos = ChunkPos::new(1, 1);
+        let holder = insert_ready_full_chunk(world, chunk_pos);
+        assert!(world.set_block(
+            BlockPos::new(20, 70, 20),
+            vanilla_blocks::LODESTONE.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Full) else {
+            panic!("inserted chunk should be Full");
+        };
+        let Some(mut prepared) =
+            ChunkStorage::prepare_chunk_save(chunk, ChunkStatus::Full, &[], true)
+        else {
+            panic!("a forced save should be prepared");
+        };
+        let (min_y, height) = (world.get_min_y(), world.get_height());
+        assert_eq!(
+            ChunkStorage::persistent_pois(&prepared.persistent, chunk_pos, min_y, height)
+                .map(|pois| pois.len())
+                .ok(),
+            Some(1)
+        );
+
+        // Truncate the packed blocks of the section holding the lodestone.
+        let section_index = usize::try_from((70 - min_y) / 16).expect("section index");
+        let PersistentSection::Heterogeneous { block_data, .. } =
+            &mut prepared.persistent.sections[section_index]
+        else {
+            panic!("the lodestone's section should be heterogeneous");
+        };
+        *block_data = block_data[..block_data.len() / 2].into();
+        assert!(matches!(
+            ChunkStorage::persistent_pois(&prepared.persistent, chunk_pos, min_y, height),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
     }
 }
