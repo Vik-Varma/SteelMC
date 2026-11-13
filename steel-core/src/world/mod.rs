@@ -371,9 +371,9 @@ impl World {
         let default_gamemode = config.default_gamemode;
         // Create storage backend based on config
         let storage: Arc<ChunkStorage> = match &config.storage {
-            WorldStorageConfig::Disk { path } => {
-                Arc::new(ChunkStorage::Disk(RegionManager::new(path.clone())))
-            }
+            WorldStorageConfig::Disk { path, sync_writes } => Arc::new(ChunkStorage::Disk(
+                RegionManager::new(path.clone()).with_sync_writes(*sync_writes),
+            )),
             WorldStorageConfig::RamOnly => {
                 Arc::new(ChunkStorage::RamOnly(RamOnlyStorage::empty_world()))
             }

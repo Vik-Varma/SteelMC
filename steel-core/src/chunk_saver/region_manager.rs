@@ -48,6 +48,8 @@ pub struct RegionManager {
     base_path: PathBuf,
     /// Open region file handles with their headers.
     regions: AsyncRwLock<FxHashMap<RegionPos, RegionHandle>>,
+    /// Whether each write waits until it is on disk, as vanilla's `sync-chunk-writes` does.
+    sync_writes: bool,
 }
 
 /// Prepared chunk data ready to be saved asynchronously.
@@ -80,10 +82,30 @@ struct RegionHandle {
     /// Sector ranges (`(start, end)`, end exclusive) that `header` does not use but the table
     /// on disk may point at, kept from allocation until the table is rewritten in full.
     reserved_sectors: Vec<(u32, u32)>,
+    /// Whether writes wait until they are on disk; see [`RegionManager::with_sync_writes`].
+    sync_writes: bool,
+    /// What each sync was for, in order.
+    #[cfg(test)]
+    syncs: Vec<&'static str>,
     /// Makes every table entry write stop partway and fail, to test what a failed save
     /// leaves behind.
     #[cfg(test)]
     fail_table_entry_writes: bool,
+}
+
+impl RegionHandle {
+    /// Waits until writes so far are on disk, if this region's writes are synchronous.
+    async fn sync_if_required(&mut self, what: &'static str) -> io::Result<()> {
+        if !self.sync_writes {
+            return Ok(());
+        }
+        self.file.sync_data().await?;
+        #[cfg(test)]
+        self.syncs.push(what);
+        #[cfg(not(test))]
+        let _ = what;
+        Ok(())
+    }
 }
 
 impl RegionManager {
@@ -96,7 +118,17 @@ impl RegionManager {
         Self {
             base_path: base_path.into(),
             regions: AsyncRwLock::new(FxHashMap::default()),
+            sync_writes: false,
         }
+    }
+
+    /// Makes every write wait until it is on disk, like vanilla's `sync-chunk-writes`, so a
+    /// save's chunk data is durable before its table entry points at it. Without this, saves
+    /// survive a crash of the server process but not of the operating system or the power.
+    #[must_use]
+    pub const fn with_sync_writes(mut self, sync_writes: bool) -> Self {
+        self.sync_writes = sync_writes;
+        self
     }
 
     /// Gets the file path for a region.
@@ -180,6 +212,9 @@ impl RegionManager {
             header_dirty: false,
             file_sectors,
             reserved_sectors: Vec::new(),
+            sync_writes: self.sync_writes,
+            #[cfg(test)]
+            syncs: Vec::new(),
             #[cfg(test)]
             fail_table_entry_writes: false,
         })
@@ -207,6 +242,9 @@ impl RegionManager {
         header_bytes.extend_from_slice(&header.to_bytes());
         file.write_all(&header_bytes).await?;
         file.flush().await?;
+        if self.sync_writes {
+            file.sync_data().await?;
+        }
 
         Ok(RegionHandle {
             file,
@@ -215,6 +253,9 @@ impl RegionManager {
             header_dirty: false,
             file_sectors: FIRST_DATA_SECTOR,
             reserved_sectors: Vec::new(),
+            sync_writes: self.sync_writes,
+            #[cfg(test)]
+            syncs: Vec::new(),
             #[cfg(test)]
             fail_table_entry_writes: false,
         })
@@ -233,6 +274,7 @@ impl RegionManager {
     /// matches it and no space needs to stay reserved.
     async fn rewrite_table(handle: &mut RegionHandle) -> io::Result<()> {
         Self::write_header(&mut handle.file, &handle.header).await?;
+        handle.sync_if_required("chunk table").await?;
         handle.header_dirty = false;
         handle.reserved_sectors.clear();
         Ok(())
@@ -257,7 +299,8 @@ impl RegionManager {
             return Err(io::Error::other("injected table entry write failure"));
         }
         handle.file.write_all(&entry.to_bytes()).await?;
-        handle.file.flush().await
+        handle.file.flush().await?;
+        handle.sync_if_required("table entry").await
     }
 
     /// Reads a chunk's compressed data from disk.
@@ -438,6 +481,8 @@ impl RegionManager {
             &mut handle.file_sectors,
         )
         .await?;
+        // The data must be on disk before the entry that points at it.
+        handle.sync_if_required("chunk data").await?;
 
         // Until the entry write finishes, the entry on disk may point at the new copy while the
         // in-memory table still has the old one. Reserve the new copy and mark the table dirty
@@ -1539,6 +1584,65 @@ mod tests {
                 .await
                 .expect("header should be readable")
         );
+        fs::remove_dir_all(directory)
+            .await
+            .expect("test directory should be removable");
+    }
+
+    async fn syncs(manager: &RegionManager, pos: ChunkPos) -> Vec<&'static str> {
+        let region_pos = RegionPos::from_chunk(pos.0.x, pos.0.y);
+        let regions = manager.regions.read().await;
+        regions
+            .get(&region_pos)
+            .expect("region should be open")
+            .syncs
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn synchronous_writes_put_chunk_data_on_disk_before_its_table_entry() {
+        let directory = test_directory("sync_writes");
+        let pos = ChunkPos::new(2, 3);
+        let manager = RegionManager::new(&directory).with_sync_writes(true);
+        manager
+            .acquire_chunk(pos)
+            .await
+            .expect("region should open");
+        let saved = manager
+            .save_chunk_data(saved_chunk(pos, 1), &test_thread_pool())
+            .await;
+        assert!(matches!(saved, Ok(true)));
+        assert_eq!(syncs(&manager, pos).await, ["chunk data", "table entry"]);
+
+        // A failed entry write leaves the table to a full rewrite, which is synced too.
+        set_table_entry_writes_failing(&manager, pos, true).await;
+        assert!(
+            manager
+                .save_chunk_data(saved_chunk(pos, 2), &test_thread_pool())
+                .await
+                .is_err()
+        );
+        set_table_entry_writes_failing(&manager, pos, false).await;
+        manager.flush_all().await.expect("table should be written");
+        assert_eq!(
+            syncs(&manager, pos).await,
+            ["chunk data", "table entry", "chunk data", "chunk table"]
+        );
+        fs::remove_dir_all(directory)
+            .await
+            .expect("test directory should be removable");
+
+        let directory = test_directory("no_sync_writes");
+        let manager = RegionManager::new(&directory);
+        manager
+            .acquire_chunk(pos)
+            .await
+            .expect("region should open");
+        let saved = manager
+            .save_chunk_data(saved_chunk(pos, 1), &test_thread_pool())
+            .await;
+        assert!(matches!(saved, Ok(true)));
+        assert_eq!(syncs(&manager, pos).await, Vec::<&str>::new());
         fs::remove_dir_all(directory)
             .await
             .expect("test directory should be removable");

@@ -195,6 +195,9 @@ pub enum WorldStorageConfig {
     Disk {
         /// Path to the world directory (e.g., "world/overworld").
         path: String,
+        /// Whether region file writes wait until they are on disk, like vanilla's
+        /// `sync-chunk-writes`.
+        sync_writes: bool,
     },
     /// RAM-only storage with empty chunks created on demand.
     /// No data is persisted — useful for testing and minigames.

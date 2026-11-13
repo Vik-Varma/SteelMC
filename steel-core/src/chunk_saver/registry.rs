@@ -127,6 +127,14 @@ impl WorldStorageRegistry {
 #[serde(deny_unknown_fields)]
 struct DiskStorageConfig {
     path: Option<String>,
+    /// Whether region file writes wait until they are on disk. Defaults to on, like the
+    /// vanilla dedicated server's `sync-chunk-writes`.
+    #[serde(default = "sync_writes_by_default")]
+    sync_writes: bool,
+}
+
+const fn sync_writes_by_default() -> bool {
+    true
 }
 
 fn validate_disk_config(config: &toml::Value) -> Result<(), String> {
@@ -166,6 +174,7 @@ fn create_disk_storage(
     Ok(WorldStorageOutput {
         storage: WorldStorageConfig::Disk {
             path: path_to_string(path.join("region")),
+            sync_writes: parsed.sync_writes,
         },
         level_data_path: Some(path),
     })
@@ -195,7 +204,35 @@ mod tests {
     use crate::worldgen::generator::registry::WorldGeneratorRegistry;
     use steel_utils::Identifier;
 
-    use super::WorldStorageRegistry;
+    use std::path::Path;
+
+    use super::{WorldStorageRegistry, create_disk_storage, validate_disk_config};
+    use crate::config::WorldStorageConfig;
+
+    #[test]
+    fn disk_storage_syncs_writes_unless_turned_off() {
+        let storage = |config: &str| {
+            let config: toml::Value = toml::from_str(config).expect("config should parse");
+            assert_eq!(validate_disk_config(&config), Ok(()));
+            create_disk_storage(&config, Path::new("saves"), Path::new("saves/world"))
+                .expect("disk storage should resolve")
+                .storage
+        };
+        assert!(matches!(
+            storage(""),
+            WorldStorageConfig::Disk {
+                sync_writes: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            storage("sync_writes = false"),
+            WorldStorageConfig::Disk {
+                sync_writes: false,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn domain_storage_accepts_durable_primary_or_entirely_ephemeral_worlds() {
