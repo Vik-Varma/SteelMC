@@ -146,7 +146,15 @@ impl ChunkStorage {
         min_y: i32,
         height: i32,
     ) -> io::Result<Vec<SavedPoi>> {
-        let expected_sections = usize::try_from(height / 16).unwrap_or_default();
+        if height <= 0 || height % 16 != 0 || min_y % 16 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "chunk world range must be section-aligned, got min_y={min_y}, height={height}"
+                ),
+            ));
+        }
+        let expected_sections = (height / 16) as usize;
         if persistent.sections.len() != expected_sections {
             return Err(Self::invalid_chunk_data(format!(
                 "chunk has {} sections, expected {expected_sections}",
@@ -450,6 +458,96 @@ mod tests {
         assert!(matches!(
             ChunkStorage::persistent_pois(&prepared.persistent, chunk_pos, min_y, height),
             Err(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn persistent_pois_validates_only_what_it_reads() {
+        steel_registry::init_vanilla_registry();
+        init_behaviors();
+        init_block_entities();
+        let world_fixture = fresh_test_world("poi-scan-validation");
+        let world = &world_fixture.world;
+        let chunk_pos = ChunkPos::new(1, 1);
+        let holder = insert_ready_full_chunk(world, chunk_pos);
+        assert!(world.set_block(
+            BlockPos::new(20, 70, 20),
+            vanilla_blocks::LODESTONE.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+        assert!(world.set_block(
+            BlockPos::new(20, 0, 20),
+            vanilla_blocks::STONE.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Full) else {
+            panic!("inserted chunk should be Full");
+        };
+        let saved = || {
+            let Some(prepared) =
+                ChunkStorage::prepare_chunk_save(chunk, ChunkStatus::Full, &[], true)
+            else {
+                panic!("a forced save should be prepared");
+            };
+            prepared.persistent
+        };
+        let (min_y, height) = (world.get_min_y(), world.get_height());
+        let section_of = |y: i32| usize::try_from((y - min_y) / 16).expect("section index");
+        let scan = |persistent: &super::super::PersistentChunk<'_>, min_y, height| {
+            ChunkStorage::persistent_pois(persistent, chunk_pos, min_y, height)
+        };
+
+        // Damage outside POI sections is not read, so the chunk is still scanned.
+        let mut damaged = saved();
+        let PersistentSection::Heterogeneous { block_data, .. } =
+            &mut damaged.sections[section_of(0)]
+        else {
+            panic!("the stone's section should be heterogeneous");
+        };
+        *block_data = Box::default();
+        assert_eq!(
+            scan(&damaged, min_y, height).map(|pois| pois.len()).ok(),
+            Some(1)
+        );
+
+        // A POI section with an impossible bit width is rejected, not unpacked.
+        let mut damaged = saved();
+        let PersistentSection::Heterogeneous { bits_per_entry, .. } =
+            &mut damaged.sections[section_of(70)]
+        else {
+            panic!("the lodestone's section should be heterogeneous");
+        };
+        *bits_per_entry = 0;
+        assert!(matches!(
+            scan(&damaged, min_y, height),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+
+        // A section made entirely of a POI block reports every block.
+        let mut solid = saved();
+        let lodestone_state = u16::try_from(
+            solid
+                .block_states
+                .iter()
+                .position(|state| state.name == vanilla_blocks::LODESTONE.key)
+                .expect("the chunk palette should hold the lodestone"),
+        )
+        .expect("palette index fits u16");
+        let PersistentSection::Homogeneous { block_state, .. } =
+            &mut solid.sections[section_of(200)]
+        else {
+            panic!("an empty section should be homogeneous");
+        };
+        *block_state = lodestone_state;
+        assert_eq!(
+            scan(&solid, min_y, height).map(|pois| pois.len()).ok(),
+            Some(1 + 4096)
+        );
+
+        // A world range that is not section-aligned is refused.
+        assert!(matches!(
+            scan(&saved(), min_y + 8, height),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput
         ));
     }
 }

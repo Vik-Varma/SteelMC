@@ -1164,4 +1164,128 @@ mod tests {
             .await
             .expect("test directory should be removable");
     }
+
+    fn empty_saved_chunk(pos: ChunkPos) -> PreparedChunkSave {
+        PreparedChunkSave {
+            pos,
+            status: ChunkStatus::Full,
+            persistent: PersistentChunk {
+                last_modified: 0,
+                block_states: Vec::new(),
+                biomes: Vec::new(),
+                sections: Vec::new(),
+                block_entities: Vec::new(),
+                entities: Vec::new(),
+                block_ticks: Vec::new(),
+                fluid_ticks: Vec::new(),
+                heightmaps: Vec::new(),
+                light: PersistentLightData::default(),
+                postprocessing: Vec::new(),
+                structure_starts: Vec::new(),
+                structure_references: Vec::new(),
+                pois: Vec::new(),
+            },
+            handled_runtime_entity_ids: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reused_read_handle_sees_a_save_made_between_chunks() {
+        let directory = test_directory("saved_reads_reuse");
+        let first = ChunkPos::new(3, 4);
+        let second = ChunkPos::new(5, 4);
+        let payload = b"first chunk bytes";
+        write_test_region(&directory, first, payload, payload.len() as u32)
+            .await
+            .expect("test region should be written");
+        let manager = RegionManager::new(&directory);
+        let mut unopened = FxHashMap::default();
+        let read = manager.read_saved_chunk(first, &mut unopened).await;
+        assert_eq!(read.ok().flatten().as_deref(), Some(&payload[..]));
+        assert!(matches!(
+            unopened.values().next(),
+            Some(UnopenedRegion::Readable(_))
+        ));
+
+        // A save opens the region, appends the chunk and closes it again between our reads.
+        let saved = manager
+            .save_chunk_data(empty_saved_chunk(second), &test_thread_pool())
+            .await;
+        assert!(matches!(saved, Ok(true)));
+        assert!(manager.regions.read().await.is_empty());
+
+        let through_reused = manager.read_saved_chunk(second, &mut unopened).await;
+        let fresh = manager
+            .read_saved_chunks(&[second], &AtomicBool::new(false))
+            .await;
+        let Ok(Some(through_reused)) = through_reused else {
+            panic!("the reused handle should see the newly saved chunk");
+        };
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].1.as_deref().ok(), Some(through_reused.as_slice()));
+
+        fs::remove_dir_all(directory)
+            .await
+            .expect("test directory should be removable");
+    }
+
+    #[tokio::test]
+    async fn saved_chunk_reads_skip_old_formats_and_report_corrupt_regions_per_chunk() {
+        let first = ChunkPos::new(3, 4);
+        let second = ChunkPos::new(5, 4);
+        let payload = b"chunk bytes";
+        let region_file = |directory: &Path| {
+            directory.join(RegionPos::from_chunk(first.0.x, first.0.y).filename())
+        };
+
+        // Another format version: no chunks, and the file is left untouched.
+        let directory = test_directory("saved_reads_old_format");
+        write_test_region(&directory, first, payload, payload.len() as u32)
+            .await
+            .expect("test region should be written");
+        let mut bytes = fs::read(region_file(&directory))
+            .await
+            .expect("region should exist");
+        bytes[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+        fs::write(region_file(&directory), &bytes)
+            .await
+            .expect("region should be rewritten");
+        let manager = RegionManager::new(&directory);
+        let read = manager
+            .read_saved_chunks(&[first, second], &AtomicBool::new(false))
+            .await;
+        assert!(read.is_empty());
+        assert_eq!(
+            fs::read(region_file(&directory)).await.ok().as_deref(),
+            Some(bytes.as_slice())
+        );
+        fs::remove_dir_all(&directory)
+            .await
+            .expect("test directory should be removable");
+
+        // Bad magic: an error for every chunk asked for, since failed opens are not cached.
+        let directory = test_directory("saved_reads_bad_magic");
+        write_test_region(&directory, first, payload, payload.len() as u32)
+            .await
+            .expect("test region should be written");
+        let mut bytes = fs::read(region_file(&directory))
+            .await
+            .expect("region should exist");
+        bytes[0..4].copy_from_slice(b"NOPE");
+        fs::write(region_file(&directory), &bytes)
+            .await
+            .expect("region should be rewritten");
+        let manager = RegionManager::new(&directory);
+        let read = manager
+            .read_saved_chunks(&[first, second], &AtomicBool::new(false))
+            .await;
+        assert_eq!(read.len(), 2);
+        assert!(read.iter().all(|(_, data)| {
+            data.as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::InvalidData)
+        }));
+        fs::remove_dir_all(directory)
+            .await
+            .expect("test directory should be removable");
+    }
 }
