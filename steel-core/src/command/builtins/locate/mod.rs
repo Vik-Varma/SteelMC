@@ -1,6 +1,7 @@
 //! Location commands.
 
 mod biome;
+mod poi;
 mod structure;
 
 use std::time::Duration;
@@ -37,7 +38,12 @@ fn command() -> CommandNodeBuilder<CommandSource, SteelCommandRuntime> {
                     .executes_suspended(biome::start_search),
             ),
         )
-    // TODO: Add `locate poi` once Steel can read POIs from unloaded saved chunks.
+        .then(
+            literal("poi").then(
+                argument("poi", SteelArgumentType::poi_type_or_tag())
+                    .executes_suspended(poi::start_search),
+            ),
+        )
 }
 
 /// Sends the locate success message and returns the distance vanilla reports.
@@ -150,6 +156,7 @@ mod tests {
         for (branch, argument_type) in [
             ("structure", SteelArgumentType::structure_or_tag_key()),
             ("biome", SteelArgumentType::biome_or_tag()),
+            ("poi", SteelArgumentType::poi_type_or_tag()),
         ] {
             let literal = child(&dispatcher, locate, branch);
             let target = child(&dispatcher, literal, branch);
@@ -160,7 +167,7 @@ mod tests {
             assert!(target_node.is_executable());
             assert!(dispatcher.children(target).is_some_and(<[_]>::is_empty));
         }
-        assert_eq!(dispatcher.children(locate).map(<[_]>::len), Some(2));
+        assert_eq!(dispatcher.children(locate).map(<[_]>::len), Some(3));
     }
 
     #[test]

@@ -11,11 +11,11 @@ use super::{
 const PALETTE_INLINE_CAPACITY: usize = 8;
 
 impl ChunkStorage {
-    fn invalid_chunk_data(message: impl Into<String>) -> io::Error {
+    pub(super) fn invalid_chunk_data(message: impl Into<String>) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, message.into())
     }
 
-    fn validate_packed_palette(
+    pub(super) fn validate_packed_palette(
         palette: &[u16],
         bits_per_entry: u8,
         data: &[u64],

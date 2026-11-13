@@ -4569,11 +4569,78 @@ fn locate_biome_command_finishes_in_the_background_with_vanilla_distances() {
 }
 
 #[test]
+fn locate_poi_command_finds_pois_in_loaded_and_saved_chunks() {
+    use crate::block_entity::init_block_entities;
+    use crate::chunk::status::ChunkStatus;
+    use crate::chunk_saver::ChunkStorage;
+
+    init_vanilla_registry();
+    init_behaviors();
+    init_block_entities();
+    let world_fixture = fresh_test_world("locate-poi-command");
+    let world = &world_fixture.world;
+    let runtime = Builder::new_current_thread().enable_all().build();
+    let Ok(runtime) = runtime else {
+        panic!("test runtime should initialize");
+    };
+    runtime.block_on(async {
+        let server = test_server(Arc::clone(world), PermissionSubjectIndex::new()).await;
+        let Ok(server) = server else {
+            panic!("test server should initialize");
+        };
+
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+        assert!(world.set_block(
+            BlockPos::new(5, 64, 3),
+            vanilla_blocks::BELL.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+
+        // Save a chunk holding a lodestone, then drop it from memory.
+        let saved_pos = ChunkPos::new(3, 0);
+        let saved_holder = insert_ready_full_chunk(world, saved_pos);
+        assert!(world.set_block(
+            BlockPos::new(50, 70, 2),
+            vanilla_blocks::LODESTONE.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
+        let Some(chunk) = saved_holder.try_chunk(ChunkStatus::Full) else {
+            panic!("inserted chunk should be Full");
+        };
+        let Some(prepared) = ChunkStorage::prepare_chunk_save(chunk, ChunkStatus::Full, &[], true)
+        else {
+            panic!("a forced save should be prepared");
+        };
+        let saved = world
+            .chunk_map
+            .storage
+            .save_chunk_data(prepared, &world.chunk_map.generation_pool)
+            .await;
+        assert!(matches!(saved, Ok(true)));
+        let _ = world.chunk_map.chunks.remove_sync(&saved_pos);
+        drop(saved_holder);
+        assert!(!world.chunk_map.unloading_chunks.contains_sync(&saved_pos));
+
+        let locate = |query: &str| {
+            run_command_to_completion(
+                &server,
+                &format!("execute positioned 0 64 0 run locate poi {query}"),
+            )
+        };
+        assert_eq!(locate("minecraft:meeting"), [(true, 5)]);
+        assert_eq!(locate("minecraft:lodestone"), [(true, 50)]);
+        assert_eq!(locate("#minecraft:acquirable_job_site"), [(false, 0)]);
+    });
+}
+
+#[test]
 fn locate_searches_finish_while_every_generation_thread_is_busy() {
+    use crate::block_entity::init_block_entities;
     use crate::test_support::block_pool;
 
     init_vanilla_registry();
     init_behaviors();
+    init_block_entities();
     let world_fixture = fresh_test_world("locate-busy-generation-pool");
     let world = &world_fixture.world;
     let runtime = Builder::new_current_thread().enable_all().build();
@@ -4585,6 +4652,12 @@ fn locate_searches_finish_while_every_generation_thread_is_busy() {
         let Ok(server) = server else {
             panic!("test server should initialize");
         };
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+        assert!(world.set_block(
+            BlockPos::new(5, 64, 3),
+            vanilla_blocks::BELL.default_state(),
+            UpdateFlags::UPDATE_ALL,
+        ));
 
         // Searches must not need a chunk generation thread. Test worlds share this pool, so
         // keep it blocked only briefly even if that regresses.
@@ -4597,6 +4670,14 @@ fn locate_searches_finish_while_every_generation_thread_is_busy() {
                 limit,
             ),
             [(true, 0)]
+        );
+        assert_eq!(
+            run_command_within(
+                &server,
+                "execute positioned 0 64 0 run locate poi minecraft:meeting",
+                limit,
+            ),
+            [(true, 5)]
         );
     });
 }

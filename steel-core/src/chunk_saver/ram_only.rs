@@ -1,4 +1,7 @@
-use std::{io, sync::Weak};
+use std::{
+    io,
+    sync::{Arc, Weak},
+};
 
 use rustc_hash::FxHashMap;
 use steel_utils::{ChunkPos, locks::AsyncRwLock};
@@ -18,7 +21,7 @@ use super::{ChunkStorage, LoadedChunk, PreparedChunkSave};
 /// Will later have the option to load a world from storage and clone it for easy world handling
 pub struct RamOnlyStorage {
     /// This saves every chunk, and it saves the changes in the world to make it possible to run the server fully in memory
-    saved_chunks: AsyncRwLock<FxHashMap<ChunkPos, SimpleRAMChunk>>,
+    saved_chunks: AsyncRwLock<FxHashMap<ChunkPos, Arc<SimpleRAMChunk>>>,
 }
 
 /// Represents a simple in-memory prepared chunk save.
@@ -74,12 +77,24 @@ impl RamOnlyStorage {
         self.saved_chunks
             .write()
             .await
-            .insert(prepared.pos, SimpleRAMChunk { prepared });
+            .insert(prepared.pos, Arc::new(SimpleRAMChunk { prepared }));
         Ok(true)
     }
 
     /// Checks if a chunk exists in storage.
     pub async fn chunk_exists(&self, pos: ChunkPos) -> io::Result<bool> {
         Ok(self.saved_chunks.read().await.contains_key(&pos))
+    }
+
+    /// Returns the saved chunks among `positions`, holding the storage lock only to collect them.
+    pub async fn saved_chunks(
+        &self,
+        positions: &[ChunkPos],
+    ) -> Vec<(ChunkPos, Arc<SimpleRAMChunk>)> {
+        let saved_chunks = self.saved_chunks.read().await;
+        positions
+            .iter()
+            .filter_map(|&pos| Some((pos, Arc::clone(saved_chunks.get(&pos)?))))
+            .collect()
     }
 }

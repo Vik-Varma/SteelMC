@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use super::{
     BiomeOrTag, BlockInput, BlockPredicate, CommandArgumentSource, Coordinates, IntRange,
-    ItemPredicate, ScoreHolderArgument, StructureOrTagKey, WorldArgument,
+    ItemPredicate, PoiTypeOrTag, ScoreHolderArgument, StructureOrTagKey, WorldArgument,
     biome::{parse_biome_or_tag, suggest_biomes},
     block::{parse_block_input, parse_block_predicate, suggest_block_inputs, suggest_blocks},
     coordinates::{
@@ -12,6 +12,7 @@ use super::{
     item_predicate::{parse_item_predicate, suggest_item_predicate},
     nbt::parse_nbt_path,
     permission::{PermissionGroupParser, PermissionMetadataParser, PermissionRuleParser},
+    poi_type::{parse_poi_type_or_tag, suggest_poi_types},
     profile::{GameProfileParser, GameProfileSuggestionMode},
     score::{parse_int_range, parse_score_holder, suggest_score_holders},
     selector::{EntitySelector, parse_entity_selector, suggest_entity_selector},
@@ -300,6 +301,10 @@ impl SteelArgumentType {
         Self::new(BiomeOrTagParser)
     }
 
+    pub(crate) fn poi_type_or_tag() -> Self {
+        Self::new(PoiTypeOrTagParser)
+    }
+
     pub(crate) fn structure_or_tag_key() -> Self {
         Self::new(StructureOrTagKeyParser)
     }
@@ -511,6 +516,7 @@ impl_downcast_type!(EntitySelector, "steel:command/value/entity_selector");
 impl_downcast_type!(ScoreHolderArgument, "steel:command/value/score_holder");
 impl_downcast_type!(IntRange, "steel:command/value/int_range");
 impl_downcast_type!(BiomeOrTag, "steel:command/value/biome_or_tag");
+impl_downcast_type!(PoiTypeOrTag, "steel:command/value/poi_type_or_tag");
 impl_downcast_type!(
     StructureOrTagKey,
     "steel:command/value/structure_or_tag_key"
@@ -953,6 +959,23 @@ unit_argument_parser!(
     protocol(
         ProtocolArgumentType::ResourceOrTag {
             identifier: "minecraft:worldgen/biome",
+        },
+        Some(ProtocolSuggestionType::AskServer),
+    )
+);
+unit_argument_parser!(
+    PoiTypeOrTagParser,
+    "steel:command/parser/poi_type_or_tag",
+    PoiTypeOrTag,
+    parse | reader,
+    _source | { parse_poi_type_or_tag(reader) },
+    suggest | _context,
+    builder | {
+        suggest_poi_types(builder);
+    },
+    protocol(
+        ProtocolArgumentType::ResourceOrTag {
+            identifier: "minecraft:point_of_interest_type",
         },
         Some(ProtocolSuggestionType::AskServer),
     )
