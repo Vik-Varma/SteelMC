@@ -94,6 +94,18 @@ impl UnopenedRegion {
         if u16::from_le_bytes([file_header[4], file_header[5]]) != FORMAT_VERSION {
             return Ok(Self::Absent);
         }
+        // Refuse a chunk table that `open_region` would refuse, so this reads nothing that
+        // loading could not.
+        let mut table_bytes = vec![0u8; CHUNK_TABLE_SIZE];
+        file.read_exact(&mut table_bytes)?;
+        let header = RegionHeader::from_bytes(&table_bytes).map_err(|index| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("region chunk table entry {index} has an invalid status byte"),
+            )
+        })?;
+        let file_sectors = file.metadata()?.len().div_ceil(SECTOR_SIZE as u64) as u32;
+        RegionManager::validate_region_entries(&header, file_sectors)?;
         Ok(Self::Readable(file))
     }
 }
@@ -1276,6 +1288,47 @@ mod tests {
             .await
             .expect("region should be rewritten");
         let manager = RegionManager::new(&directory);
+        let read = manager
+            .read_saved_chunks(&[first, second], &AtomicBool::new(false))
+            .await;
+        assert_eq!(read.len(), 2);
+        assert!(read.iter().all(|(_, data)| {
+            data.as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::InvalidData)
+        }));
+        fs::remove_dir_all(directory)
+            .await
+            .expect("test directory should be removable");
+    }
+
+    #[tokio::test]
+    async fn saved_chunk_reads_refuse_regions_that_loading_would_refuse() {
+        let directory = test_directory("saved_reads_overlap");
+        let first = ChunkPos::new(3, 4);
+        let second = ChunkPos::new(5, 4);
+        let payload = b"chunk bytes";
+        write_test_region(&directory, first, payload, payload.len() as u32)
+            .await
+            .expect("test region should be written");
+        // Point a second chunk at the first one's sectors, which `open_region` rejects.
+        let region_file = directory.join(RegionPos::from_chunk(first.0.x, first.0.y).filename());
+        let mut bytes = fs::read(&region_file).await.expect("region should exist");
+        let entry_offset = |pos: ChunkPos| {
+            let (local_x, local_z) = RegionPos::local_chunk_pos(pos.0.x, pos.0.y);
+            FILE_HEADER_SIZE + RegionHeader::chunk_index(local_x, local_z) * 8
+        };
+        let first_entry = entry_offset(first);
+        let entry: [u8; 8] = bytes[first_entry..first_entry + 8]
+            .try_into()
+            .expect("entry is 8 bytes");
+        let second_entry = entry_offset(second);
+        bytes[second_entry..second_entry + 8].copy_from_slice(&entry);
+        fs::write(&region_file, &bytes)
+            .await
+            .expect("region should be rewritten");
+
+        let manager = RegionManager::new(&directory);
+        assert!(manager.acquire_chunk(first).await.is_err());
         let read = manager
             .read_saved_chunks(&[first, second], &AtomicBool::new(false))
             .await;
