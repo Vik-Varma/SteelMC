@@ -52,6 +52,24 @@ impl ChunkStorage {
         thread_pool: &rayon::ThreadPool,
         cancelled: &Arc<AtomicBool>,
     ) -> io::Result<Vec<(ChunkPos, Vec<SavedPoi>)>> {
+        Ok(self
+            .saved_chunk_poi_results(positions, min_y, height, thread_pool, cancelled)
+            .await?
+            .into_iter()
+            .filter_map(|(chunk_pos, found)| readable_pois(chunk_pos, found))
+            .collect())
+    }
+
+    /// [`Self::saved_chunk_pois`], but with each saved chunk's own result, so an unreadable
+    /// chunk is reported rather than skipped.
+    pub async fn saved_chunk_poi_results(
+        &self,
+        positions: &[ChunkPos],
+        min_y: i32,
+        height: i32,
+        thread_pool: &rayon::ThreadPool,
+        cancelled: &Arc<AtomicBool>,
+    ) -> io::Result<Vec<(ChunkPos, io::Result<Vec<SavedPoi>>)>> {
         let saved: Vec<(ChunkPos, SavedChunk)> = match self {
             Self::Disk(regions) => regions
                 .read_saved_chunks(positions, cancelled)
@@ -90,26 +108,13 @@ impl ChunkStorage {
                         Self::persistent_pois(&chunk.prepared.persistent, chunk_pos, min_y, height)
                     }
                 };
-                by_chunk.extend(Self::readable_pois(chunk_pos, found));
+                by_chunk.push((chunk_pos, found));
             }
             let _ = sender.send(Ok(by_chunk));
         });
         receiver
             .await
             .map_err(|_| io::Error::other("saved POI scan ended without a result"))?
-    }
-
-    fn readable_pois(
-        chunk_pos: ChunkPos,
-        found: io::Result<Vec<SavedPoi>>,
-    ) -> Option<(ChunkPos, Vec<SavedPoi>)> {
-        match found {
-            Ok(found) => Some((chunk_pos, found)),
-            Err(error) => {
-                tracing::warn!(chunk = ?chunk_pos, "Skipping unreadable saved chunk while reading POIs: {error}");
-                None
-            }
-        }
     }
 
     fn decode_saved_pois(
@@ -229,6 +234,21 @@ impl ChunkStorage {
 const fn section_offset(origin: BlockPos, index: usize) -> BlockPos {
     let index = index as i32;
     origin.offset(index & 15, index >> 8, (index >> 4) & 15)
+}
+
+/// `found`, or `None` after logging why a saved chunk could not be read, as vanilla logs and
+/// skips a POI section it cannot read.
+pub(crate) fn readable_pois(
+    chunk_pos: ChunkPos,
+    found: io::Result<Vec<SavedPoi>>,
+) -> Option<(ChunkPos, Vec<SavedPoi>)> {
+    match found {
+        Ok(found) => Some((chunk_pos, found)),
+        Err(error) => {
+            tracing::warn!(chunk = ?chunk_pos, "Skipping unreadable saved chunk while reading POIs: {error}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

@@ -20,14 +20,14 @@ use crate::world::World;
 const ANSWER_REUSED_FOR: Duration = Duration::from_secs(5);
 /// How long a lookup may stay unfinished before another is started in its place.
 const LOOKUP_GIVEN_UP_AFTER: Duration = Duration::from_secs(30);
-/// Lookups this old are dropped once there are more than [`KEPT_LOOKUPS`].
+/// Lookups this old are dropped once [`KEPT_LOOKUPS`] are kept.
 const LOOKUP_DROPPED_AFTER: Duration = Duration::from_secs(60);
 const KEPT_LOOKUPS: usize = 256;
 
 /// What is known about the POI at a position in a chunk not loaded as Full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnloadedPoi {
-    /// The chunk is still being read.
+    /// The chunk is being read, or could not be read.
     Unknown,
     /// The POI type there, if any.
     Known(Option<usize>),
@@ -37,13 +37,23 @@ pub(crate) enum UnloadedPoi {
 enum Lookup {
     Running {
         started: Instant,
-        /// The previous answer, still given while this lookup runs.
-        previous: UnloadedPoi,
     },
     Finished {
         poi_type: Option<usize>,
         at: Instant,
     },
+    Unreadable {
+        at: Instant,
+    },
+}
+
+impl Lookup {
+    const fn at(self) -> Instant {
+        match self {
+            Self::Running { started } => started,
+            Self::Finished { at, .. } | Self::Unreadable { at } => at,
+        }
+    }
 }
 
 /// Per-world record of POI lookups in chunks not loaded as Full.
@@ -55,46 +65,39 @@ pub(crate) struct SavedPoiLookups {
 impl World {
     /// The POI type at `pos`, which must be in a chunk not loaded as Full, as vanilla's
     /// `PoiManager` would load it: from the chunk's blocks if it is in memory at a lower
-    /// status, otherwise from its save. A chunk that was never saved has no POIs, and one
-    /// that cannot be read is treated as having none, as vanilla treats unreadable POI data.
+    /// status, otherwise from its save. A chunk that was never saved has no POIs.
     ///
     /// Returns [`UnloadedPoi::Unknown`] while the chunk is being read, and starts that read.
-    /// An answer is reused for a few seconds; after that the next call reads the chunk again,
-    /// giving the old answer until the new one is ready.
+    /// An answer is given for a few seconds, then the chunk is read again; answers are never
+    /// given once stale, since the chunk may have been loaded and changed meanwhile.
+    ///
+    /// Unlike vanilla, which treats POI data it cannot read as empty, a chunk that cannot be
+    /// read stays [`UnloadedPoi::Unknown`] and is read again later: Steel refuses a whole
+    /// region when part of its table is damaged, so treating that as empty would discard
+    /// answers for every chunk in it.
     pub(crate) fn unloaded_poi_type_at(&self, pos: BlockPos) -> UnloadedPoi {
         let now = Instant::now();
         let mut lookups = self.saved_poi_lookups.lookups.lock();
-        let previous = match lookups.get(&pos) {
-            Some(&Lookup::Finished { poi_type, at }) => {
-                if now.duration_since(at) < ANSWER_REUSED_FOR {
-                    return UnloadedPoi::Known(poi_type);
-                }
-                UnloadedPoi::Known(poi_type)
+        match lookups.get(&pos) {
+            Some(&Lookup::Finished { poi_type, at })
+                if now.duration_since(at) < ANSWER_REUSED_FOR =>
+            {
+                return UnloadedPoi::Known(poi_type);
             }
-            Some(&Lookup::Running { started, previous }) => {
-                if now.duration_since(started) < LOOKUP_GIVEN_UP_AFTER {
-                    return previous;
-                }
-                previous
+            Some(&Lookup::Unreadable { at }) if now.duration_since(at) < ANSWER_REUSED_FOR => {
+                return UnloadedPoi::Unknown;
             }
-            None => UnloadedPoi::Unknown,
-        };
-        if lookups.len() >= KEPT_LOOKUPS {
-            lookups.retain(|_, lookup| {
-                let at = match *lookup {
-                    Lookup::Running { started, .. } => started,
-                    Lookup::Finished { at, .. } => at,
-                };
-                now.duration_since(at) < LOOKUP_DROPPED_AFTER
-            });
+            Some(&Lookup::Running { started })
+                if now.duration_since(started) < LOOKUP_GIVEN_UP_AFTER =>
+            {
+                return UnloadedPoi::Unknown;
+            }
+            _ => {}
         }
-        lookups.insert(
-            pos,
-            Lookup::Running {
-                started: now,
-                previous,
-            },
-        );
+        if lookups.len() >= KEPT_LOOKUPS {
+            lookups.retain(|_, lookup| now.duration_since(lookup.at()) < LOOKUP_DROPPED_AFTER);
+        }
+        lookups.insert(pos, Lookup::Running { started: now });
         drop(lookups);
 
         let chunk_map = Arc::clone(&self.chunk_map);
@@ -102,30 +105,204 @@ impl World {
         let columns = PoiSquareColumns::single(&chunk_map, ChunkPos::from_block_pos(pos));
         self.chunk_map.chunk_runtime.spawn(async move {
             let found = columns
-                .pois(
+                .pois_by_chunk(
                     &chunk_map.storage,
                     &chunk_map.generation_pool,
                     &Arc::new(AtomicBool::new(false)),
                 )
-                .await;
-            let poi_type = match found {
-                Ok(found) => found
-                    .into_iter()
-                    .find(|&(poi_pos, _)| poi_pos == pos)
-                    .map(|(_, poi_type)| poi_type),
-                Err(error) => {
-                    tracing::warn!("Couldn't read the POIs of the chunk holding {pos:?}: {error}");
-                    None
-                }
-            };
-            lookups.lock().insert(
-                pos,
-                Lookup::Finished {
-                    poi_type,
+                .await
+                .and_then(|by_chunk| {
+                    by_chunk
+                        .into_iter()
+                        .next()
+                        .map_or(Ok(Vec::new()), |(_, found)| found)
+                });
+            let finished = match found {
+                Ok(found) => Lookup::Finished {
+                    poi_type: found
+                        .into_iter()
+                        .find(|&(poi_pos, _)| poi_pos == pos)
+                        .map(|(_, poi_type)| poi_type),
                     at: Instant::now(),
                 },
-            );
+                Err(error) => {
+                    tracing::warn!("Couldn't read the POIs of the chunk holding {pos:?}: {error}");
+                    Lookup::Unreadable { at: Instant::now() }
+                }
+            };
+            record(&mut lookups.lock(), pos, now, finished);
         });
-        previous
+        UnloadedPoi::Unknown
+    }
+}
+
+/// Records the result of the lookup at `pos` started at `started`, unless a lookup started
+/// after it was given up on owns the entry now.
+fn record(
+    lookups: &mut FxHashMap<BlockPos, Lookup>,
+    pos: BlockPos,
+    started: Instant,
+    finished: Lookup,
+) {
+    if matches!(lookups.get(&pos), Some(&Lookup::Running { started: current }) if current == started)
+    {
+        lookups.insert(pos, finished);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::Arc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use rustc_hash::FxHashMap;
+    use steel_registry::{RegistryEntry, init_vanilla_registry, vanilla_blocks, vanilla_poi_types};
+    use steel_utils::{BlockPos, ChunkPos, types::UpdateFlags};
+
+    use super::{Lookup, UnloadedPoi, record};
+    use crate::{
+        behavior::init_behaviors,
+        block_entity::init_block_entities,
+        chunk::status::ChunkStatus,
+        chunk_saver::{ChunkStorage, PreparedChunkSave},
+        test_support::{fresh_test_world, insert_ready_full_chunk},
+        world::World,
+    };
+
+    /// Saves a Full chunk at `chunk_pos`, after `edit` changes what is saved, then drops it
+    /// from memory.
+    fn save_and_unload(
+        world: &Arc<World>,
+        chunk_pos: ChunkPos,
+        lodestone: Option<BlockPos>,
+        edit: impl FnOnce(&mut PreparedChunkSave),
+    ) {
+        let holder = insert_ready_full_chunk(world, chunk_pos);
+        if let Some(lodestone) = lodestone {
+            assert!(world.set_block(
+                lodestone,
+                vanilla_blocks::LODESTONE.default_state(),
+                UpdateFlags::UPDATE_ALL
+            ));
+        }
+        let Some(chunk) = holder.try_chunk(ChunkStatus::Full) else {
+            panic!("inserted chunk should be Full");
+        };
+        let Some(mut prepared) =
+            ChunkStorage::prepare_chunk_save(chunk, ChunkStatus::Full, &[], true)
+        else {
+            panic!("a forced save should be prepared");
+        };
+        edit(&mut prepared);
+        let saved = world.chunk_map.chunk_runtime.block_on(
+            world
+                .chunk_map
+                .storage
+                .save_chunk_data(prepared, &world.chunk_map.generation_pool),
+        );
+        assert!(matches!(saved, Ok(true)));
+        let _ = world.chunk_map.chunks.remove_sync(&chunk_pos);
+        world.poi_storage.lock().remove_chunk(chunk_pos);
+    }
+
+    fn wait_for_answer(world: &World, pos: BlockPos) -> UnloadedPoi {
+        let started = Instant::now();
+        loop {
+            let answer = world.unloaded_poi_type_at(pos);
+            if answer != UnloadedPoi::Unknown {
+                return answer;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "no answer for {pos:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_stale_answer_is_never_given_while_the_chunk_is_read_again() {
+        init_vanilla_registry();
+        init_behaviors();
+        init_block_entities();
+        let world_fixture = fresh_test_world("saved_poi_lookup_stale");
+        let world = &world_fixture.world;
+        let lodestone = BlockPos::new(40, 70, 2);
+        save_and_unload(world, ChunkPos::new(2, 0), Some(lodestone), |_| {});
+
+        // An answer from before the lodestone was placed has expired.
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("the clock is past a minute");
+        world.saved_poi_lookups.lookups.lock().insert(
+            lodestone,
+            Lookup::Finished {
+                poi_type: None,
+                at: long_ago,
+            },
+        );
+        assert_eq!(world.unloaded_poi_type_at(lodestone), UnloadedPoi::Unknown);
+        let lodestone_type = vanilla_poi_types::LODESTONE
+            .try_id()
+            .expect("vanilla POI types should be registered");
+        assert_eq!(
+            wait_for_answer(world, lodestone),
+            UnloadedPoi::Known(Some(lodestone_type))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_chunk_gives_no_answer() {
+        init_vanilla_registry();
+        init_behaviors();
+        init_block_entities();
+        let world_fixture = fresh_test_world("saved_poi_lookup_unreadable");
+        let world = &world_fixture.world;
+        let target = BlockPos::new(40, 70, 2);
+        // A saved chunk missing a section cannot be read.
+        save_and_unload(world, ChunkPos::new(2, 0), None, |prepared| {
+            prepared.persistent.sections.pop();
+        });
+
+        assert_eq!(world.unloaded_poi_type_at(target), UnloadedPoi::Unknown);
+        let started = Instant::now();
+        while !matches!(
+            world.saved_poi_lookups.lookups.lock().get(&target),
+            Some(Lookup::Unreadable { .. })
+        ) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the read never finished"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(world.unloaded_poi_type_at(target), UnloadedPoi::Unknown);
+    }
+
+    #[test]
+    fn a_lookup_given_up_on_cannot_overwrite_the_one_that_replaced_it() {
+        let pos = BlockPos::new(1, 2, 3);
+        let first = Instant::now();
+        let second = first + Duration::from_secs(31);
+        let mut lookups = FxHashMap::default();
+        lookups.insert(pos, Lookup::Running { started: second });
+        let late = Lookup::Finished {
+            poi_type: Some(7),
+            at: second,
+        };
+
+        record(&mut lookups, pos, first, late);
+        assert!(matches!(lookups.get(&pos), Some(Lookup::Running { .. })));
+        record(&mut lookups, pos, second, late);
+        assert!(matches!(
+            lookups.get(&pos),
+            Some(Lookup::Finished {
+                poi_type: Some(7),
+                ..
+            })
+        ));
     }
 }

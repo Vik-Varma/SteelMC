@@ -349,6 +349,22 @@ mod tests {
             tick_until_target(&player, Some(lodestone));
             thread::sleep(Duration::from_millis(5));
         }
+        // The read found the saved lodestone.
+        let started = Instant::now();
+        let lodestone_type = vanilla_poi_types::LODESTONE.try_id();
+        loop {
+            match world.unloaded_poi_type_at(lodestone) {
+                UnloadedPoi::Known(found) => {
+                    assert_eq!(found, lodestone_type);
+                    break;
+                }
+                UnloadedPoi::Unknown => {
+                    assert!(started.elapsed() < Duration::from_secs(5));
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        tick_until_target(&player, Some(lodestone));
 
         // No lodestone is saved at this position of the same chunk.
         let beside = BlockPos::new(41, 70, 2);

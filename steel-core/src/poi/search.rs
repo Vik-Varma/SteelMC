@@ -20,7 +20,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     chunk::{Chunk, chunk_holder::ChunkHolder, chunk_map::ChunkMap, status::ChunkStatus},
-    chunk_saver::{ChunkStorage, SavedPoi, poi_search_cancelled},
+    chunk_saver::{ChunkStorage, SavedPoi, poi_search_cancelled, readable_pois},
 };
 
 /// The chunks a vanilla POI square query visits, captured with any in-memory holder.
@@ -90,6 +90,23 @@ impl PoiSquareColumns {
         thread_pool: &ThreadPool,
         cancelled: &Arc<AtomicBool>,
     ) -> io::Result<Vec<SavedPoi>> {
+        Ok(self
+            .pois_by_chunk(storage, thread_pool, cancelled)
+            .await?
+            .into_iter()
+            .filter_map(|(chunk_pos, found)| readable_pois(chunk_pos, found))
+            .flat_map(|(_, found)| found)
+            .collect())
+    }
+
+    /// [`Self::pois`] per captured chunk, in capture order, with a saved chunk that cannot be
+    /// read reported as its error rather than skipped.
+    pub async fn pois_by_chunk(
+        self,
+        storage: &ChunkStorage,
+        thread_pool: &ThreadPool,
+        cancelled: &Arc<AtomicBool>,
+    ) -> io::Result<Vec<(ChunkPos, io::Result<Vec<SavedPoi>>)>> {
         let (min_y, height) = (self.min_y, self.height);
         let (sender, receiver) = oneshot::channel();
         let scan_cancelled = Arc::clone(cancelled);
@@ -122,21 +139,22 @@ impl PoiSquareColumns {
             .filter(|(_, in_memory)| in_memory.is_none())
             .map(|&(pos, _)| pos)
             .collect();
-        let mut saved: FxHashMap<ChunkPos, Vec<SavedPoi>> = storage
-            .saved_chunk_pois(&unloaded, min_y, height, thread_pool, cancelled)
+        let mut saved: FxHashMap<ChunkPos, io::Result<Vec<SavedPoi>>> = storage
+            .saved_chunk_poi_results(&unloaded, min_y, height, thread_pool, cancelled)
             .await?
             .into_iter()
             .collect();
 
-        let mut found = Vec::new();
-        for (chunk_pos, in_memory) in scanned {
-            found.extend(
-                in_memory
+        Ok(scanned
+            .into_iter()
+            .map(|(chunk_pos, in_memory)| {
+                let found = in_memory
+                    .map(Ok)
                     .or_else(|| saved.remove(&chunk_pos))
-                    .unwrap_or_default(),
-            );
-        }
-        Ok(found)
+                    .unwrap_or_else(|| Ok(Vec::new()));
+                (chunk_pos, found)
+            })
+            .collect())
     }
 }
 

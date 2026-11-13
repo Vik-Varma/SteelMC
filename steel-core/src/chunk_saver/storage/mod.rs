@@ -66,6 +66,7 @@ mod poi;
 mod structures;
 mod ticks;
 
+pub(crate) use poi::readable_pois;
 pub use poi::{SavedPoi, poi_search_cancelled};
 
 #[cfg(test)]
