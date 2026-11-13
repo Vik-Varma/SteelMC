@@ -268,21 +268,27 @@ impl StructurePlacement {
         source_z: i32,
         ring_positions: Option<&[ChunkPos]>,
     ) -> bool {
-        if !self.is_placement_chunk(seed, source_x, source_z, ring_positions) {
-            return false;
-        }
-        if self.frequency < 1.0
-            && !self.frequency_reduction_method.should_generate(
+        self.is_placement_chunk(seed, source_x, source_z, ring_positions)
+            && self.applies_additional_chunk_restrictions(seed, source_x, source_z)
+    }
+
+    /// Vanilla's `applyAdditionalChunkRestrictions`: the frequency check for a placement
+    /// chunk.
+    #[must_use]
+    pub fn applies_additional_chunk_restrictions(
+        &self,
+        seed: i64,
+        source_x: i32,
+        source_z: i32,
+    ) -> bool {
+        self.frequency >= 1.0
+            || self.frequency_reduction_method.should_generate(
                 seed,
                 self.salt,
                 source_x,
                 source_z,
                 self.frequency,
             )
-        {
-            return false;
-        }
-        true
     }
 
     fn is_placement_chunk(
