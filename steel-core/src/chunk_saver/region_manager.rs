@@ -357,9 +357,6 @@ impl RegionManager {
 
         let mut regions = self.regions.write().await;
 
-        // Track if we opened the region (so we can close it after)
-        let we_opened_region = !regions.contains_key(&region_pos);
-
         // Get or open the region
         let handle = if let Some(handle) = regions.get_mut(&region_pos) {
             handle
@@ -396,8 +393,9 @@ impl RegionManager {
             super::format::ChunkEntry::new(sector_offset, compressed.len() as u32, status);
 
         handle.header_dirty = true;
-        // If we opened this region and no chunks are loaded from it, close it immediately.
-        if we_opened_region && handle.loaded_chunk_count == 0 {
+        // With no chunks loaded from it, the region is only open for this save (or because an
+        // earlier close failed to write its table), so close it now.
+        if handle.loaded_chunk_count == 0 {
             Self::close_region(&mut regions, region_pos).await?;
         }
 
@@ -1140,6 +1138,37 @@ mod tests {
                 .await
                 .expect("header should be readable")
         );
+        fs::remove_dir_all(directory)
+            .await
+            .expect("test directory should be removable");
+    }
+
+    #[tokio::test]
+    async fn next_save_into_a_region_left_open_by_a_failed_write_retries_it() {
+        let directory = test_directory("save_retries_table");
+        let pos = ChunkPos::new(2, 3);
+        let manager = RegionManager::new(&directory);
+        save_into_open_region(&manager, pos).await;
+        let writable = fail_table_writes(&manager, &directory, pos).await;
+        assert!(manager.release_chunk(pos).await.is_err());
+        restore_table_writes(&manager, pos, writable).await;
+
+        // Nothing is loaded from the region any more, so the next save closes it.
+        let other = ChunkPos::new(4, 3);
+        let saved = manager
+            .save_chunk_data(empty_saved_chunk(other), &test_thread_pool())
+            .await;
+        assert!(matches!(saved, Ok(true)));
+        assert!(manager.regions.read().await.is_empty());
+        let fresh = RegionManager::new(&directory);
+        for pos in [pos, other] {
+            assert!(
+                fresh
+                    .chunk_exists(pos)
+                    .await
+                    .expect("header should be readable")
+            );
+        }
         fs::remove_dir_all(directory)
             .await
             .expect("test directory should be removable");
