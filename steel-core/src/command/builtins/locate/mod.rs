@@ -102,17 +102,16 @@ fn locate_coordinates_component(pos: BlockPos, include_y: bool) -> TextComponent
     } else {
         "~".to_owned()
     };
-    TextComponent::plain("[")
-        .add_child(
-            translations::CHAT_COORDINATES
-                .message([
-                    TextComponent::from(pos.0.x.to_string()),
-                    TextComponent::from(displayed_y.clone()),
-                    TextComponent::from(pos.0.z.to_string()),
-                ])
-                .component(),
-        )
-        .add_child(TextComponent::plain("]"))
+    let coordinates = translations::CHAT_COORDINATES
+        .message([
+            TextComponent::from(pos.0.x.to_string()),
+            TextComponent::from(displayed_y.clone()),
+            TextComponent::from(pos.0.z.to_string()),
+        ])
+        .component();
+    translations::CHAT_SQUARE_BRACKETS
+        .message([coordinates])
+        .component()
         .color(Color::Green)
         .hover_event(HoverEvent::show_text(
             &translations::CHAT_COORDINATES_TOOLTIP,
@@ -129,6 +128,7 @@ mod tests {
     use super::*;
     use crate::command::brigadier::{CommandDispatcher, NodeId};
     use steel_registry::init_vanilla_registry;
+    use text_components::content::Content;
 
     type Dispatcher = CommandDispatcher<CommandSource, SteelCommandRuntime>;
 
@@ -174,6 +174,19 @@ mod tests {
     fn locate_coordinates_component_matches_vanilla_interactivity() {
         let component = locate_coordinates_component(BlockPos::new(12, 0, -34), false);
 
+        // `ComponentUtils.wrapInSquareBrackets` around `chat.coordinates`, styled on the outside.
+        let Content::Translate(brackets) = &component.content else {
+            panic!("coordinates should be wrapped in a translated component");
+        };
+        assert_eq!(brackets.key, "chat.square_brackets");
+        let Some([coordinates]) = brackets.args.as_deref() else {
+            panic!("square brackets should wrap exactly the coordinates");
+        };
+        assert!(matches!(
+            &coordinates.content,
+            Content::Translate(message) if message.key == "chat.coordinates"
+        ));
+        assert_eq!(component.children, [] as [TextComponent; 0]);
         assert_eq!(component.format.color, Some(Color::Green));
         assert!(matches!(
             component.interactions.click,
