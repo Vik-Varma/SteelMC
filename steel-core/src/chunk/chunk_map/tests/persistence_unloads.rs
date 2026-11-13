@@ -350,6 +350,37 @@ fn add_claimed_home_poi(world: &World, pos: BlockPos) -> usize {
 }
 
 #[test]
+fn a_poi_ticket_claimed_while_its_chunk_unloads_is_saved() {
+    init_vanilla_registry();
+    init_behaviors();
+    let world_fixture = fresh_test_world("poi_ticket_while_unloading");
+    let world = &world_fixture.world;
+    let chunk_pos = ChunkPos::new(0, 0);
+    let poi_pos = BlockPos::new(1, 64, 1);
+    let holder = insert_ready_full_chunk(world, chunk_pos);
+    let home = vanilla_poi_types::HOME
+        .try_id()
+        .expect("vanilla home POI type should be registered");
+    world.poi_storage.lock().add(poi_pos, home, 1);
+
+    world.chunk_map.update_chunk_level(chunk_pos, None);
+    assert!(world.chunk_map.unloading_chunks.contains_sync(&chunk_pos));
+    let Some(chunk) = holder.try_chunk(ChunkStatus::Full) else {
+        panic!("unloading test chunk must remain Full");
+    };
+    chunk.clear_dirty();
+
+    // The POI is still in storage, so the claim succeeds and must keep the chunk from being
+    // dropped unsaved.
+    assert!(world.reserve_poi_ticket(poi_pos));
+    assert!(chunk.is_dirty());
+    chunk.clear_dirty();
+    assert!(world.release_poi_ticket(poi_pos));
+    assert!(chunk.is_dirty());
+    stop_chunk_tasks(world);
+}
+
+#[test]
 fn unloading_full_chunk_keeps_pois_for_its_save_and_revival() {
     init_vanilla_registry();
     init_behaviors();

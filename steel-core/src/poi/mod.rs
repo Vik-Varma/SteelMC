@@ -11,9 +11,11 @@ pub use poi_instance::PointOfInterest;
 pub use poi_set::PointOfInterestSet;
 pub use poi_storage::{OccupationStatus, PointOfInterestStorage};
 
+use std::sync::Arc;
+
 use steel_utils::{BlockPos, ChunkPos};
 
-use crate::world::World;
+use crate::{chunk::status::ChunkStatus, world::World};
 
 impl World {
     /// Claims one of the POI at `pos`'s tickets, as a villager claims a bed or job site.
@@ -24,7 +26,7 @@ impl World {
     pub fn reserve_poi_ticket(&self, pos: BlockPos) -> bool {
         let reserved = self.poi_storage.lock().reserve_ticket(pos);
         if reserved {
-            self.mark_chunk_dirty(ChunkPos::from_block_pos(pos));
+            self.mark_poi_chunk_dirty(pos);
         }
         reserved
     }
@@ -34,9 +36,31 @@ impl World {
     pub fn release_poi_ticket(&self, pos: BlockPos) -> bool {
         let released = self.poi_storage.lock().release_ticket(pos);
         if released {
-            self.mark_chunk_dirty(ChunkPos::from_block_pos(pos));
+            self.mark_poi_chunk_dirty(pos);
         }
         released
+    }
+
+    /// Marks the chunk holding the POI at `pos` for saving. POIs stay in storage while their
+    /// chunk waits to unload, so its holder may be active or unloading; a dirty unloading
+    /// chunk is saved again before it is dropped.
+    fn mark_poi_chunk_dirty(&self, pos: BlockPos) {
+        let chunk_pos = ChunkPos::from_block_pos(pos);
+        let chunk_map = &self.chunk_map;
+        let holder = chunk_map
+            .chunks
+            .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))
+            .or_else(|| {
+                chunk_map
+                    .unloading_chunks
+                    .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))
+            });
+        if let Some(chunk) = holder
+            .as_deref()
+            .and_then(|holder| holder.try_chunk(ChunkStatus::Full))
+        {
+            chunk.mark_dirty();
+        }
     }
 }
 
