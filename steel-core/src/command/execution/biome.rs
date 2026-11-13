@@ -74,29 +74,31 @@ pub(super) fn parse_biome_or_tag(
     Err(error)
 }
 
+/// Suggests biomes and biome tags. Like vanilla, tags are only offered for empty input or
+/// input starting with `#`.
 pub(super) fn suggest_biomes(builder: &mut SuggestionsBuilder<'_>) {
     let remaining = builder.remaining_lowercase();
-    let suggestions = if let Some(tag_prefix) = remaining.strip_prefix('#') {
+    let tags = |prefix: &str| {
         REGISTRY
             .biomes
             .tag_keys()
-            .filter(|tag| identifier_matches(tag_prefix, tag))
+            .filter(|tag| identifier_matches(prefix, tag))
             .map(|tag| format!("#{tag}"))
             .collect::<Vec<_>>()
+    };
+    let suggestions = if let Some(tag_prefix) = remaining.strip_prefix('#') {
+        tags(tag_prefix)
     } else {
-        REGISTRY
+        let mut biomes = REGISTRY
             .biomes
             .iter()
             .filter(|(_, biome)| identifier_matches(remaining, &biome.key))
             .map(|(_, biome)| biome.key.to_string())
-            .chain(
-                REGISTRY
-                    .biomes
-                    .tag_keys()
-                    .filter(|tag| identifier_matches(remaining, tag))
-                    .map(|tag| format!("#{tag}")),
-            )
-            .collect()
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            biomes.extend(tags(remaining));
+        }
+        biomes
     };
     for suggestion in suggestions {
         builder.suggest(suggestion);
