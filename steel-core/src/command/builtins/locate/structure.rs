@@ -130,8 +130,15 @@ struct Scan {
 }
 
 struct PendingCheck {
+    receiver: oneshot::Receiver<CheckedCandidates>,
+}
+
+/// Candidates with their checks, in scan order.
+struct CheckedCandidates {
     candidates: Vec<StructureLocateCandidate>,
-    receiver: oneshot::Receiver<Vec<CandidateCheck>>,
+    checks: Vec<CandidateCheck>,
+    /// For a random-spread check, the radius to check next.
+    next_radius: Option<i32>,
 }
 
 struct LocatedStructure {
@@ -173,24 +180,15 @@ impl CommandResultSuspension for LocateStructureSearch {
                     if self.random_radius > MAX_STRUCTURE_SEARCH_RADIUS {
                         return self.finished_result();
                     }
-
-                    let candidates = self
-                        .plan
-                        .random_spread_candidates_at_radius(self.origin, self.random_radius);
-                    self.random_radius += 1;
-
-                    if candidates.is_empty() {
-                        continue;
-                    }
-                    self.start_check(Stage::RandomSpreadShell, candidates);
+                    self.start_shell_check();
                     return CommandResultSuspensionPoll::Pending;
                 }
                 LocatePhase::Checking => {
                     let Some(check) = &mut self.check else {
                         return Self::cancelled_result();
                     };
-                    let checks = match check.receiver.try_recv() {
-                        Ok(checks) => checks,
+                    let checked = match check.receiver.try_recv() {
+                        Ok(checked) => checked,
                         Err(oneshot::error::TryRecvError::Empty) => {
                             return CommandResultSuspensionPoll::Pending;
                         }
@@ -198,10 +196,11 @@ impl CommandResultSuspension for LocateStructureSearch {
                             return Self::cancelled_result();
                         }
                     };
-                    let Some(check) = self.check.take() else {
-                        return Self::cancelled_result();
-                    };
-                    self.scans = scans(check.candidates, checks);
+                    self.check = None;
+                    if let Some(next_radius) = checked.next_radius {
+                        self.random_radius = next_radius;
+                    }
+                    self.scans = scans(checked.candidates, checked.checks);
                     self.phase = LocatePhase::Resolving;
                 }
                 LocatePhase::Resolving => match self.resolve_scans() {
@@ -241,27 +240,61 @@ impl CommandResultSuspension for LocateStructureSearch {
 impl LocateStructureSearch {
     /// Checks `candidates` on the locate search pool, off the server thread.
     fn start_check(&mut self, stage: Stage, candidates: Vec<StructureLocateCandidate>) {
+        self.spawn_check(stage, move |world, plan, cancelled| {
+            let checks = check_candidates(world, plan, &candidates, cancelled)?;
+            Some(CheckedCandidates {
+                candidates,
+                checks,
+                next_radius: None,
+            })
+        });
+    }
+
+    /// Checks random-spread shells from the current radius outward on the locate search pool,
+    /// stopping at the first shell where a requested structure could start or is known to.
+    /// Shells where none could start need no chunk, so they cost no further poll.
+    fn start_shell_check(&mut self) {
+        let origin = self.origin;
+        let first_radius = self.random_radius;
+        self.spawn_check(Stage::RandomSpreadShell, move |world, plan, cancelled| {
+            for radius in first_radius..=MAX_STRUCTURE_SEARCH_RADIUS {
+                let candidates = plan.random_spread_candidates_at_radius(origin, radius);
+                let checks = check_candidates(world, plan, &candidates, cancelled)?;
+                if checks.iter().any(|check| *check != CandidateCheck::Absent) {
+                    return Some(CheckedCandidates {
+                        candidates,
+                        checks,
+                        next_radius: Some(radius + 1),
+                    });
+                }
+            }
+            Some(CheckedCandidates {
+                candidates: Vec::new(),
+                checks: Vec::new(),
+                next_radius: Some(MAX_STRUCTURE_SEARCH_RADIUS + 1),
+            })
+        });
+    }
+
+    fn spawn_check(
+        &mut self,
+        stage: Stage,
+        check: impl FnOnce(&World, &StructureLocatePlan, &AtomicBool) -> Option<CheckedCandidates>
+        + Send
+        + 'static,
+    ) {
         let (sender, receiver) = oneshot::channel();
         let world = Arc::clone(&self.world);
         let plan = Arc::clone(&self.plan);
         let cancelled = Arc::clone(&self.cancelled);
-        let to_check = candidates.clone();
         self.source.server().locate_search_pool.spawn(move || {
-            let mut checks = Vec::with_capacity(to_check.len());
-            for candidate in to_check {
-                // Dropping the sender ends the search as cancelled.
-                if cancelled.load(Ordering::Relaxed) {
-                    return;
-                }
-                checks.push(check_candidate(&world, &plan, candidate));
+            // A cancelled check drops the sender, which ends the search as cancelled.
+            if let Some(checked) = check(&world, &plan, &cancelled) {
+                let _ = sender.send(checked);
             }
-            let _ = sender.send(checks);
         });
         self.stage = stage;
-        self.check = Some(PendingCheck {
-            candidates,
-            receiver,
-        });
+        self.check = Some(PendingCheck { receiver });
         self.phase = LocatePhase::Checking;
     }
 
@@ -423,6 +456,21 @@ fn scans(candidates: Vec<StructureLocateCandidate>, checks: Vec<CandidateCheck>)
     }
     scans.sort_by_key(|(scan_id, _)| *scan_id);
     scans.into_iter().map(|(_, scan)| scan).collect()
+}
+
+/// [`check_candidate`] for each of `candidates`, or `None` once `cancelled` is set.
+fn check_candidates(
+    world: &World,
+    plan: &StructureLocatePlan,
+    candidates: &[StructureLocateCandidate],
+    cancelled: &AtomicBool,
+) -> Option<Vec<CandidateCheck>> {
+    candidates
+        .iter()
+        .map(|&candidate| {
+            (!cancelled.load(Ordering::Relaxed)).then(|| check_candidate(world, plan, candidate))
+        })
+        .collect()
 }
 
 /// Vanilla's `StructureCheck.checkStart` for a candidate, over every requested structure of
