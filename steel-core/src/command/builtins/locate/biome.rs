@@ -23,6 +23,7 @@ use super::super::super::{
 use super::show_locate_result;
 use crate::worldgen::generator::ChunkGenerator;
 
+// Search limits from vanilla's `LocateCommand`.
 const MAX_BIOME_SEARCH_RADIUS: i32 = 6400;
 const BIOME_SAMPLE_RESOLUTION_HORIZONTAL: i32 = 32;
 const BIOME_SAMPLE_RESOLUTION_VERTICAL: i32 = 64;
