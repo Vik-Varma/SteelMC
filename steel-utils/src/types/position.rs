@@ -450,10 +450,7 @@ impl BlockPos {
     /// distances across the whole world do not overflow.
     #[must_use]
     pub fn dist_sqr(&self, other: BlockPos) -> f64 {
-        let dx = f64::from(self.0.x) - f64::from(other.0.x);
-        let dy = f64::from(self.0.y) - f64::from(other.0.y);
-        let dz = f64::from(self.0.z) - f64::from(other.0.z);
-        dx * dx + dy * dy + dz * dz
+        self.0.as_dvec3().distance_squared(other.0.as_dvec3())
     }
 
     /// Returns whether the squared integer distance to `other` is below `distance` squared.

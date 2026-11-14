@@ -4553,8 +4553,6 @@ fn title_command_delivers_vanilla_packets_to_recorded_connections() {
 
 #[test]
 fn locate_biome_command_finishes_in_the_background_with_vanilla_distances() {
-    use steel_registry::init_vanilla_registry;
-
     init_vanilla_registry();
     init_behaviors();
     let world_fixture = fresh_test_world("locate-biome-command");
