@@ -679,32 +679,26 @@ pub(crate) fn fresh_test_derived_world(primary: &Arc<World>, name: &'static str)
 /// Keeps every thread of a Rayon pool busy until dropped, so tests can prove work waits on
 /// (or avoids) that pool.
 pub(crate) struct BlockedPool {
-    release: Option<mpsc::Sender<()>>,
+    /// Dropping the sender wakes every blocked thread.
+    _release: mpsc::Sender<()>,
 }
 
-impl Drop for BlockedPool {
-    fn drop(&mut self) {
-        // Dropping the sender wakes every blocked thread.
-        self.release.take();
-    }
-}
-
-/// Occupies all of `pool`'s threads; they are released when the guard drops.
-pub(crate) fn block_pool(pool: &rayon::ThreadPool) -> BlockedPool {
-    let threads = pool.current_num_threads();
-    let started = Arc::new(Barrier::new(threads + 1));
-    let (release, wait) = mpsc::channel::<()>();
-    let wait = Arc::new(SyncMutex::new(wait));
-    for _ in 0..threads {
-        let started = Arc::clone(&started);
-        let wait = Arc::clone(&wait);
-        pool.spawn(move || {
-            started.wait();
-            let _ = wait.lock().recv();
-        });
-    }
-    started.wait();
-    BlockedPool {
-        release: Some(release),
+impl BlockedPool {
+    /// Occupies all of `pool`'s threads; they are released when the guard drops.
+    pub(crate) fn new(pool: &rayon::ThreadPool) -> Self {
+        let threads = pool.current_num_threads();
+        let started = Arc::new(Barrier::new(threads + 1));
+        let (release, wait) = mpsc::channel::<()>();
+        let wait = Arc::new(SyncMutex::new(wait));
+        for _ in 0..threads {
+            let started = Arc::clone(&started);
+            let wait = Arc::clone(&wait);
+            pool.spawn(move || {
+                started.wait();
+                let _ = wait.lock().recv();
+            });
+        }
+        started.wait();
+        Self { _release: release }
     }
 }
