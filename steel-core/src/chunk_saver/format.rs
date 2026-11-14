@@ -85,8 +85,11 @@ pub const SECTOR_SIZE: usize = 4096;
 /// Size of the file header (magic + version + padding).
 pub const FILE_HEADER_SIZE: usize = 8;
 
+/// Size of one chunk location table entry.
+pub const CHUNK_ENTRY_SIZE: usize = 8;
+
 /// Size of the chunk location table (1024 entries × 8 bytes).
-pub const CHUNK_TABLE_SIZE: usize = CHUNKS_PER_REGION * 8;
+pub const CHUNK_TABLE_SIZE: usize = CHUNKS_PER_REGION * CHUNK_ENTRY_SIZE;
 
 /// Total header size (file header + chunk table).
 pub const TOTAL_HEADER_SIZE: usize = FILE_HEADER_SIZE + CHUNK_TABLE_SIZE;
@@ -140,6 +143,12 @@ impl ChunkEntry {
             size_bytes: 0,
             status: ChunkStatus::Empty,
         }
+    }
+
+    /// The sectors this chunk occupies, as `(start, end)` with `end` exclusive.
+    #[must_use]
+    pub const fn sector_range(&self) -> (u32, u32) {
+        (self.sector_offset, self.sector_offset + self.sector_count())
     }
 
     /// Calculates the number of sectors this chunk occupies.
@@ -209,6 +218,12 @@ impl RegionHeader {
         }
     }
 
+    /// Byte offset of the table entry at `index` in a region file.
+    #[must_use]
+    pub const fn entry_offset(index: usize) -> u64 {
+        (FILE_HEADER_SIZE + index * CHUNK_ENTRY_SIZE) as u64
+    }
+
     /// Gets the local index for a chunk position within this region.
     #[must_use]
     pub const fn chunk_index(local_x: usize, local_z: usize) -> usize {
@@ -265,7 +280,7 @@ impl RegionHeader {
             .entries
             .iter()
             .filter(|e| e.exists())
-            .map(|e| (e.sector_offset, e.sector_offset + e.sector_count()))
+            .map(ChunkEntry::sector_range)
             .chain(reserved.iter().copied())
             .collect();
         used_ranges.sort_by_key(|r| r.0);
@@ -363,6 +378,7 @@ impl PersistentLightSection {
 /// Each chunk stores its own block state and biome palettes, making it
 /// self-contained. Sections reference indices into these chunk-level palettes.
 #[derive(SchemaWrite, SchemaRead)]
+#[cfg_attr(test, derive(Default))]
 pub struct PersistentChunk<'a> {
     /// Unix timestamp of last modification.
     pub last_modified: u32,
