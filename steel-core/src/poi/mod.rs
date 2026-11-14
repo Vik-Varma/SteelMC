@@ -43,10 +43,8 @@ impl World {
     /// chunk waits to unload, so its holder may be active or unloading; a dirty unloading
     /// chunk is saved again before it is dropped.
     fn mark_poi_chunk_dirty(&self, pos: BlockPos) {
-        let holder = self.chunk_map.current_holder(ChunkPos::from_block_pos(pos));
-        if let Some(chunk) = holder
-            .as_deref()
-            .and_then(|holder| holder.try_chunk(ChunkStatus::Full))
+        if let Some(holder) = self.chunk_map.current_holder(ChunkPos::from_block_pos(pos))
+            && let Some(chunk) = holder.try_chunk(ChunkStatus::Full)
         {
             chunk.mark_dirty();
         }

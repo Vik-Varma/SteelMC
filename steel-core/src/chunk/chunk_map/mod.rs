@@ -477,6 +477,16 @@ impl ChunkMap {
         holder.try_full_chunk().map(f)
     }
 
+    /// The holder at `chunk_pos`, active or waiting to unload.
+    pub(crate) fn current_holder(&self, chunk_pos: ChunkPos) -> Option<Arc<ChunkHolder>> {
+        self.chunks
+            .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))
+            .or_else(|| {
+                self.unloading_chunks
+                    .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))
+            })
+    }
+
     /// Returns the active holder for a fully loaded chunk.
     pub(crate) fn active_full_chunk_holder(&self, pos: ChunkPos) -> Option<Arc<ChunkHolder>> {
         let holder = self.lookup_active_holder(pos)?;
