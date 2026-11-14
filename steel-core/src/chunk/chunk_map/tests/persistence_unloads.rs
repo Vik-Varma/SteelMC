@@ -182,6 +182,8 @@ fn final_full_chunk_unload_finalizes_chunk_owned_tick_queues() {
         TickPriority::Normal,
         0,
     );
+    let poi_pos = BlockPos::new(4, 64, 1);
+    add_claimed_home_poi(world, poi_pos);
     chunk.common().take_dirty();
     assert!(world.has_registered_full_chunk_ticks(chunk_pos));
     assert!(world.has_indexed_scheduled_tick_head(chunk_pos));
@@ -198,6 +200,7 @@ fn final_full_chunk_unload_finalizes_chunk_owned_tick_queues() {
     assert!(!world.has_indexed_scheduled_tick_head(chunk_pos));
     assert!(block_entity.is_removed());
     assert!(sign.is_removed());
+    assert_eq!(world.poi_storage.lock().get_type(poi_pos), None);
     assert_eq!(world.block_entity_tickers().registered_len(), 1);
 
     world.chunk_map.finish_block_entity_unloads();
@@ -386,29 +389,4 @@ fn unloading_full_chunk_keeps_pois_for_its_save_and_revival() {
     assert!(Arc::ptr_eq(&original, &revived));
     assert_eq!(world.poi_storage.lock().get_type(poi_pos), Some(home));
     assert!(world.poi_storage.lock().is_occupied(poi_pos));
-}
-
-#[test]
-fn final_full_chunk_unload_drops_chunk_pois() {
-    init_vanilla_registry();
-    init_behaviors();
-    let world_fixture = fresh_test_world("poi_final_unload");
-    let world = &world_fixture.world;
-    let chunk_pos = ChunkPos::new(0, 0);
-    let poi_pos = BlockPos::new(1, 64, 1);
-    let holder = insert_ready_full_chunk(world, chunk_pos);
-    add_claimed_home_poi(world, poi_pos);
-    let Some(chunk) = holder.try_full_chunk() else {
-        panic!("inserted test chunk must remain Full");
-    };
-    chunk.common().take_dirty();
-
-    world.chunk_map.update_chunk_level(chunk_pos, None);
-    world.chunk_map.rebuild_ticking_chunk_snapshot();
-    drop(holder);
-    let _runtime_guard = world.chunk_map.chunk_runtime.enter();
-    world.chunk_map.process_unloads();
-
-    assert!(!world.chunk_map.unloading_chunks.contains_sync(&chunk_pos));
-    assert_eq!(world.poi_storage.lock().get_type(poi_pos), None);
 }
