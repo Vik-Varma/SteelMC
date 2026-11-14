@@ -163,7 +163,7 @@ impl ChunkEntry {
 
     /// Serializes to 8 bytes: [offset: 4][size: 3][flags: 1]
     #[must_use]
-    pub const fn to_bytes(self) -> [u8; 8] {
+    pub const fn to_bytes(self) -> [u8; CHUNK_ENTRY_SIZE] {
         let offset_bytes = self.sector_offset.to_le_bytes();
         let size_bytes = self.size_bytes.to_le_bytes();
         let flags = self.status.get_index() as u8;
@@ -181,7 +181,7 @@ impl ChunkEntry {
 
     /// Deserializes from 8 bytes.
     #[must_use]
-    pub fn from_bytes(bytes: [u8; 8]) -> Option<Self> {
+    pub fn from_bytes(bytes: [u8; CHUNK_ENTRY_SIZE]) -> Option<Self> {
         let sector_offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let size_bytes = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], 0]);
         let status = if sector_offset == 0 {
@@ -256,7 +256,7 @@ impl RegionHeader {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, usize> {
         assert_eq!(bytes.len(), CHUNK_TABLE_SIZE);
         let mut entries = Box::new([ChunkEntry::default(); CHUNKS_PER_REGION]);
-        for (i, &chunk) in bytes.as_chunks::<8>().0.iter().enumerate() {
+        for (i, &chunk) in bytes.as_chunks::<CHUNK_ENTRY_SIZE>().0.iter().enumerate() {
             let Some(entry) = ChunkEntry::from_bytes(chunk) else {
                 return Err(i);
             };

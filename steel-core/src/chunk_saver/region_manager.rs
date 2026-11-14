@@ -652,14 +652,11 @@ impl RegionManager {
 
         let mut regions = self.regions.write().await;
 
-        let should_close = if let Some(handle) = regions.get_mut(&region_pos) {
-            handle.loaded_chunk_count = handle.loaded_chunk_count.saturating_sub(1);
-            handle.loaded_chunk_count == 0
-        } else {
+        let Some(handle) = regions.get_mut(&region_pos) else {
             return Ok(());
         };
-
-        if should_close {
+        handle.loaded_chunk_count = handle.loaded_chunk_count.saturating_sub(1);
+        if handle.loaded_chunk_count == 0 {
             Self::close_region(&mut regions, region_pos).await?;
         }
 
@@ -795,10 +792,8 @@ mod tests {
         let mut file = File::create(path).await?;
         file.write_all(&RegionManager::file_header()).await?;
 
-        let (local_x, local_z) = RegionPos::local_chunk_pos(pos.0.x, pos.0.y);
-        let index = RegionHeader::chunk_index(local_x, local_z);
         let mut header = RegionHeader::new();
-        header.entries[index] =
+        header.entries[chunk_index(pos)] =
             ChunkEntry::new(FIRST_DATA_SECTOR, declared_size, ChunkStatus::Empty);
         file.write_all(&header.to_bytes()).await?;
         file.seek(io::SeekFrom::Start(
@@ -1070,7 +1065,7 @@ mod tests {
             .await
             .expect("region should open");
         save(manager, saved_chunk(pos, 0)).await;
-        save_with_torn_entry(manager, saved_chunk(pos, 0)).await;
+        save_with_torn_entry(manager, saved_chunk(pos, 1)).await;
         open_region_entry(manager, pos).await
     }
 
@@ -1148,6 +1143,8 @@ mod tests {
             saved.to_bytes(),
             "the retried close must repair the entry"
         );
+        // It points at the copy saved before the failed save.
+        assert_eq!(last_modified_on_disk(&directory, pos, saved).await, 0);
         fs::remove_dir_all(directory)
             .await
             .expect("test directory should be removable");
@@ -1296,49 +1293,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_after_a_failed_table_entry_write_repairs_the_entry() {
-        let directory = test_directory("save_entry_repair");
-        let pos = ChunkPos::new(2, 3);
-        let manager = RegionManager::new(&directory);
-        manager
-            .acquire_chunk(pos)
-            .await
-            .expect("region should open");
-        save(&manager, saved_chunk(pos, 1)).await;
-        let first = open_region_entry(&manager, pos).await;
-
-        with_open_region(&manager, pos, |handle| {
-            handle.fail_table_entry_writes = true;
-        })
-        .await;
-        assert!(
-            manager
-                .save_chunk_data(saved_chunk(pos, 2), &test_thread_pool())
-                .await
-                .is_err()
-        );
-        assert_ne!(
-            entry_on_disk(&directory, pos).await,
-            first.to_bytes(),
-            "the injected failure should leave a partly written entry"
-        );
-        with_open_region(&manager, pos, |handle| {
-            handle.fail_table_entry_writes = false;
-        })
-        .await;
-        manager
-            .release_chunk(pos)
-            .await
-            .expect("region should close");
-
-        assert_eq!(entry_on_disk(&directory, pos).await, first.to_bytes());
-        assert_eq!(last_modified_on_disk(&directory, pos, first).await, 1);
-        fs::remove_dir_all(directory)
-            .await
-            .expect("test directory should be removable");
-    }
-
-    #[tokio::test]
     async fn repeated_saves_reuse_freed_space_instead_of_growing_the_file() {
         let directory = test_directory("save_reuses_space");
         let pos = ChunkPos::new(2, 3);
@@ -1350,8 +1304,7 @@ mod tests {
         for last_modified in 0..20 {
             save(&manager, saved_chunk(pos, last_modified)).await;
         }
-        let region_pos = RegionPos::from_chunk(pos.0.x, pos.0.y);
-        let file_sectors = manager.regions.read().await[&region_pos].file_sectors;
+        let file_sectors = with_open_region(&manager, pos, |handle| handle.file_sectors).await;
         // One sector for the current copy and one for the copy being replaced.
         assert_eq!(file_sectors, FIRST_DATA_SECTOR + 2);
         fs::remove_dir_all(directory)
@@ -1416,7 +1369,7 @@ mod tests {
         fs::create_dir_all(&directory)
             .await
             .expect("test directory should be creatable");
-        // A crash between writing the file header and the chunk table leaves this behind.
+        // A creation cut short can leave only the file header.
         fs::write(
             directory.join(region_pos.filename()),
             RegionManager::file_header(),
@@ -1513,10 +1466,8 @@ mod tests {
         save_into_open_region(&manager, pos).await;
         set_table_writes_failing(&manager, pos, true).await;
         assert!(manager.release_chunk(pos).await.is_err());
-        set_table_writes_failing(&manager, pos, false).await;
         // Nothing is loaded from the region now, so the next save closes it, and that close's
-        // table rewrite fails.
-        set_table_writes_failing(&manager, pos, true).await;
+        // table rewrite still fails.
         save(&manager, saved_chunk(ChunkPos::new(4, 3), 1)).await;
         assert!(
             !manager.regions.read().await.is_empty(),
