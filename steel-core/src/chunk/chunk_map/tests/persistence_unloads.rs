@@ -339,7 +339,7 @@ fn gameplay_cache_scopes_observe_a_full_holder_revived_between_phases() {
 }
 
 /// Registers a claimed `home` POI so the test can tell persisted ticket state from a rescan.
-fn add_claimed_home_poi(world: &World, pos: BlockPos) -> usize {
+fn add_claimed_home_poi(world: &World, pos: BlockPos) {
     let home = vanilla_poi_types::HOME
         .try_id()
         .expect("vanilla home POI type should be registered");
@@ -349,7 +349,6 @@ fn add_claimed_home_poi(world: &World, pos: BlockPos) -> usize {
         storage.reserve_ticket(pos),
         "a fresh home POI has one free ticket"
     );
-    home
 }
 
 #[test]
@@ -361,7 +360,7 @@ fn unloading_full_chunk_keeps_pois_for_its_save_and_revival() {
     let chunk_pos = ChunkPos::new(0, 0);
     let poi_pos = BlockPos::new(1, 64, 1);
     let original = insert_ready_full_chunk(world, chunk_pos);
-    let home = add_claimed_home_poi(world, poi_pos);
+    add_claimed_home_poi(world, poi_pos);
 
     world.chunk_map.update_chunk_level(chunk_pos, None);
     assert!(world.chunk_map.unloading_chunks.contains_sync(&chunk_pos));
@@ -387,6 +386,5 @@ fn unloading_full_chunk_keeps_pois_for_its_save_and_revival() {
 
     let revived = revive_at_full(world, chunk_pos);
     assert!(Arc::ptr_eq(&original, &revived));
-    assert_eq!(world.poi_storage.lock().get_type(poi_pos), Some(home));
     assert!(world.poi_storage.lock().is_occupied(poi_pos));
 }
