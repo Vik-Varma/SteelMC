@@ -20,7 +20,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     chunk::{Chunk, chunk_holder::ChunkHolder, chunk_map::ChunkMap, status::ChunkStatus},
-    chunk_saver::{ChunkStorage, SavedPoi, poi_search_cancelled, readable_pois},
+    chunk_saver::{ChunkStorage, SavedPoi, poi_search_cancelled},
 };
 
 /// The chunks a vanilla POI square query visits, captured with any in-memory holder.
@@ -53,7 +53,9 @@ impl PoiSquareColumns {
         for z in center_chunk.0.y - chunk_radius..=center_chunk.0.y + chunk_radius {
             for x in center_chunk.0.x - chunk_radius..=center_chunk.0.x + chunk_radius {
                 let pos = ChunkPos::new(x, z);
-                let holder = current_holder(chunk_map, pos).map(|holder| Arc::downgrade(&holder));
+                let holder = chunk_map
+                    .current_holder(pos)
+                    .map(|holder| Arc::downgrade(&holder));
                 columns.push((pos, holder));
             }
         }
@@ -68,7 +70,9 @@ impl PoiSquareColumns {
     /// Captures the one chunk at `chunk_pos`.
     #[must_use]
     pub fn single(chunk_map: &Arc<ChunkMap>, chunk_pos: ChunkPos) -> Self {
-        let holder = current_holder(chunk_map, chunk_pos).map(|holder| Arc::downgrade(&holder));
+        let holder = chunk_map
+            .current_holder(chunk_pos)
+            .map(|holder| Arc::downgrade(&holder));
         Self {
             columns: vec![(chunk_pos, holder)],
             chunk_map: Arc::downgrade(chunk_map),
@@ -94,8 +98,13 @@ impl PoiSquareColumns {
             .pois_by_chunk(storage, thread_pool, cancelled)
             .await?
             .into_iter()
-            .filter_map(|(chunk_pos, found)| readable_pois(chunk_pos, found))
-            .flat_map(|(_, found)| found)
+            .flat_map(|(chunk_pos, found)| {
+                // Like vanilla with a POI section it cannot read, log and skip it.
+                found.unwrap_or_else(|error| {
+                    tracing::warn!(chunk = ?chunk_pos, "Skipping unreadable saved chunk while reading POIs: {error}");
+                    Vec::new()
+                })
+            })
             .collect())
     }
 
@@ -120,7 +129,7 @@ impl PoiSquareColumns {
                 }
                 let holder = chunk_map
                     .as_deref()
-                    .and_then(|chunk_map| current_holder(chunk_map, chunk_pos))
+                    .and_then(|chunk_map| chunk_map.current_holder(chunk_pos))
                     .or_else(|| holder.and_then(|holder| holder.upgrade()));
                 let in_memory = holder.and_then(|holder| {
                     let chunk = holder.try_chunk(ChunkStatus::Empty)?;
@@ -140,7 +149,7 @@ impl PoiSquareColumns {
             .map(|&(pos, _)| pos)
             .collect();
         let mut saved: FxHashMap<ChunkPos, io::Result<Vec<SavedPoi>>> = storage
-            .saved_chunk_poi_results(&unloaded, min_y, height, thread_pool, cancelled)
+            .saved_chunk_pois(&unloaded, min_y, height, thread_pool, cancelled)
             .await?
             .into_iter()
             .collect();
@@ -158,20 +167,8 @@ impl PoiSquareColumns {
     }
 }
 
-/// The holder at `pos`, active or pending unload.
-fn current_holder(chunk_map: &ChunkMap, pos: ChunkPos) -> Option<Arc<ChunkHolder>> {
-    chunk_map
-        .chunks
-        .read_sync(&pos, |_, holder| Arc::clone(holder))
-        .or_else(|| {
-            chunk_map
-                .unloading_chunks
-                .read_sync(&pos, |_, holder| Arc::clone(holder))
-        })
-}
-
 fn in_memory_pois(chunk: &Chunk, chunk_pos: ChunkPos) -> Vec<SavedPoi> {
-    let min_section_y = chunk.min_y() >> 4;
+    let min_section_y = SectionPos::block_to_section_coord(chunk.min_y());
     let mut found = Vec::new();
     for (index, section) in chunk.sections().sections.iter().enumerate() {
         let section = section.read();
@@ -196,25 +193,17 @@ pub fn find_closest_with_type(
     radius: i32,
 ) -> Option<SavedPoi> {
     let radius_sqr = f64::from(radius * radius);
-    let mut closest: Option<(f64, SavedPoi)> = None;
-    for (pos, poi_type) in pois {
-        if !matches(poi_type)
-            || (pos.x() - center.x()).abs() > radius
-            || (pos.z() - center.z()).abs() > radius
-        {
-            continue;
-        }
-        let dx = f64::from(pos.x()) - f64::from(center.x());
-        let dy = f64::from(pos.y()) - f64::from(center.y());
-        let dz = f64::from(pos.z()) - f64::from(center.z());
-        let distance_sqr = dx * dx + dy * dy + dz * dz;
-        if distance_sqr <= radius_sqr
-            && closest.is_none_or(|(closest_sqr, _)| distance_sqr < closest_sqr)
-        {
-            closest = Some((distance_sqr, (pos, poi_type)));
-        }
-    }
-    closest.map(|(_, poi)| poi)
+    pois.into_iter()
+        .filter(|&(pos, poi_type)| {
+            matches(poi_type)
+                && (pos.x() - center.x()).abs() <= radius
+                && (pos.z() - center.z()).abs() <= radius
+        })
+        .map(|poi| (poi.0.dist_sqr(center), poi))
+        .filter(|&(distance_sqr, _)| distance_sqr <= radius_sqr)
+        // `min_by` keeps the first of equal minima.
+        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+        .map(|(_, poi)| poi)
 }
 
 #[cfg(test)]
@@ -228,7 +217,7 @@ mod tests {
     };
 
     use super::{PoiSquareColumns, find_closest_with_type};
-    use crate::test_support::{block_pool, fresh_test_world, insert_ready_full_chunk};
+    use crate::test_support::{BlockedPool, fresh_test_world, insert_ready_full_chunk};
     use steel_utils::{BlockPos, ChunkPos};
 
     const HOME: usize = 1;
@@ -290,7 +279,7 @@ mod tests {
         );
         let cancelled = Arc::new(AtomicBool::new(false));
 
-        let blocked = block_pool(&pool);
+        let blocked = BlockedPool::new(&pool);
         let search = world.chunk_map.chunk_runtime.spawn({
             let storage = Arc::clone(&world.chunk_map.storage);
             let pool = Arc::clone(&pool);

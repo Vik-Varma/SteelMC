@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use super::{
     BiomeOrTag, BlockInput, BlockPredicate, CommandArgumentSource, Coordinates, IntRange,
     ItemPredicate, PoiTypeOrTag, ScoreHolderArgument, StructureOrTagKey, WorldArgument,
-    biome::{parse_biome_or_tag, suggest_biomes},
+    biome::parse_biome_or_tag,
     block::{parse_block_input, parse_block_predicate, suggest_block_inputs, suggest_blocks},
     coordinates::{
         parse_block_pos, parse_rotation, parse_vec2, parse_vec3, suggest_coordinates, suggest_vec2,
@@ -12,8 +12,9 @@ use super::{
     item_predicate::{parse_item_predicate, suggest_item_predicate},
     nbt::parse_nbt_path,
     permission::{PermissionGroupParser, PermissionMetadataParser, PermissionRuleParser},
-    poi_type::{parse_poi_type_or_tag, suggest_poi_types},
+    poi_type::parse_poi_type_or_tag,
     profile::{GameProfileParser, GameProfileSuggestionMode},
+    resource_or_tag::suggest_resource_or_tag,
     score::{parse_int_range, parse_score_holder, suggest_score_holders},
     selector::{EntitySelector, parse_entity_selector, suggest_entity_selector},
     structure::{parse_structure_or_tag_key, suggest_structures},
@@ -954,7 +955,7 @@ unit_argument_parser!(
     _source | { parse_biome_or_tag(reader) },
     suggest | _context,
     builder | {
-        suggest_biomes(builder);
+        suggest_resource_or_tag(builder, &REGISTRY.biomes);
     },
     protocol(
         ProtocolArgumentType::ResourceOrTag {
@@ -971,7 +972,7 @@ unit_argument_parser!(
     _source | { parse_poi_type_or_tag(reader) },
     suggest | _context,
     builder | {
-        suggest_poi_types(builder);
+        suggest_resource_or_tag(builder, &REGISTRY.poi_types);
     },
     protocol(
         ProtocolArgumentType::ResourceOrTag {

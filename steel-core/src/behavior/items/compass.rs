@@ -137,7 +137,7 @@ mod tests {
     use crate::entity::{Entity, LivingEntity};
     use crate::player::Player;
     use crate::test_support::{
-        TestPlayerBuilder, block_pool, fresh_test_world, insert_ready_full_chunk,
+        BlockedPool, TestPlayerBuilder, fresh_test_world, insert_ready_full_chunk,
     };
     use glam::DVec3;
     use steel_registry::blocks::properties::Direction;
@@ -340,7 +340,7 @@ mod tests {
             .set_selected_item(compass_for(lodestone));
         {
             // Hold the read back so these ticks find it still running.
-            let _blocked = block_pool(&world.chunk_map.generation_pool);
+            let _blocked = BlockedPool::new(&world.chunk_map.generation_pool);
             for _ in 0..5 {
                 tick_until_target(&player, Some(lodestone));
             }

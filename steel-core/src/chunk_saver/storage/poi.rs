@@ -9,13 +9,13 @@ use std::{
 };
 
 use steel_registry::REGISTRY;
-use steel_utils::{BlockPos, ChunkPos};
+use steel_utils::{BlockPos, ChunkPos, SectionPos};
 use tokio::sync::oneshot;
 
 use super::super::{
     SimpleRAMChunk,
     bit_pack::unpack_indices,
-    format::{PersistentChunk, PersistentSection},
+    format::{BLOCKS_PER_SECTION, PersistentChunk, PersistentSection},
 };
 use super::ChunkStorage;
 
@@ -38,31 +38,13 @@ impl ChunkStorage {
     /// Returns the POI blocks of saved chunks, by chunk, without loading the chunks.
     ///
     /// Types come from the saved block states, so this sees the same POIs vanilla's POI
-    /// sections hold for generated chunks. Missing chunks yield nothing; unreadable ones are
-    /// logged and skipped, as vanilla does with a POI section it cannot read.
+    /// sections hold for generated chunks. Missing chunks yield nothing; unreadable ones
+    /// yield their error.
     ///
     /// Decoding and scanning run on `thread_pool`, outside any storage lock. Once `cancelled`
     /// is set, the work stops at the next chunk and the call fails with
     /// [`poi_search_cancelled`].
     pub async fn saved_chunk_pois(
-        &self,
-        positions: &[ChunkPos],
-        min_y: i32,
-        height: i32,
-        thread_pool: &rayon::ThreadPool,
-        cancelled: &Arc<AtomicBool>,
-    ) -> io::Result<Vec<(ChunkPos, Vec<SavedPoi>)>> {
-        Ok(self
-            .saved_chunk_poi_results(positions, min_y, height, thread_pool, cancelled)
-            .await?
-            .into_iter()
-            .filter_map(|(chunk_pos, found)| readable_pois(chunk_pos, found))
-            .collect())
-    }
-
-    /// [`Self::saved_chunk_pois`], but with each saved chunk's own result, so an unreadable
-    /// chunk is reported rather than skipped.
-    pub async fn saved_chunk_poi_results(
         &self,
         positions: &[ChunkPos],
         min_y: i32,
@@ -151,21 +133,7 @@ impl ChunkStorage {
         min_y: i32,
         height: i32,
     ) -> io::Result<Vec<SavedPoi>> {
-        if height <= 0 || height % 16 != 0 || min_y % 16 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "chunk world range must be section-aligned, got min_y={min_y}, height={height}"
-                ),
-            ));
-        }
-        let expected_sections = (height / 16) as usize;
-        if persistent.sections.len() != expected_sections {
-            return Err(Self::invalid_chunk_data(format!(
-                "chunk has {} sections, expected {expected_sections}",
-                persistent.sections.len()
-            )));
-        }
+        Self::validate_section_layout(persistent, min_y, height)?;
 
         let mut palette_types: Vec<Option<Option<usize>>> =
             vec![None; persistent.block_states.len()];
@@ -182,17 +150,19 @@ impl ChunkStorage {
         };
 
         let mut pois = Vec::new();
+        let min_section_y = SectionPos::block_to_section_coord(min_y);
         for (section_index, section) in persistent.sections.iter().enumerate() {
-            let origin = BlockPos::new(
-                chunk_pos.0.x * 16,
-                min_y + section_index as i32 * 16,
-                chunk_pos.0.y * 16,
+            let section_pos = SectionPos::new(
+                chunk_pos.0.x,
+                min_section_y + section_index as i32,
+                chunk_pos.0.y,
             );
             match section {
                 PersistentSection::Homogeneous { block_state, .. } => {
                     if let Some(poi_type) = poi_type_at(*block_state)? {
                         pois.extend(
-                            (0..4096).map(|index| (section_offset(origin, index), poi_type)),
+                            (0..BLOCKS_PER_SECTION)
+                                .map(|index| (section_pos.block_at_index(index), poi_type)),
                         );
                     }
                 }
@@ -213,41 +183,21 @@ impl ChunkStorage {
                         palette,
                         *bits_per_entry,
                         block_data,
-                        4096,
+                        BLOCKS_PER_SECTION,
                         persistent.block_states.len(),
                         "block-state",
                     )?;
-                    let indices = unpack_indices(block_data, *bits_per_entry).take(4096);
+                    let indices =
+                        unpack_indices(block_data, *bits_per_entry).take(BLOCKS_PER_SECTION);
                     for (index, palette_index) in indices.enumerate() {
                         if let Some(poi_type) = section_types[palette_index as usize] {
-                            pois.push((section_offset(origin, index), poi_type));
+                            pois.push((section_pos.block_at_index(index), poi_type));
                         }
                     }
                 }
             }
         }
         Ok(pois)
-    }
-}
-
-/// The block at `index` of a section stored in y, z, x order.
-const fn section_offset(origin: BlockPos, index: usize) -> BlockPos {
-    let index = index as i32;
-    origin.offset(index & 15, index >> 8, (index >> 4) & 15)
-}
-
-/// `found`, or `None` after logging why a saved chunk could not be read, as vanilla logs and
-/// skips a POI section it cannot read.
-pub(crate) fn readable_pois(
-    chunk_pos: ChunkPos,
-    found: io::Result<Vec<SavedPoi>>,
-) -> Option<(ChunkPos, Vec<SavedPoi>)> {
-    match found {
-        Ok(found) => Some((chunk_pos, found)),
-        Err(error) => {
-            tracing::warn!(chunk = ?chunk_pos, "Skipping unreadable saved chunk while reading POIs: {error}");
-            None
-        }
     }
 }
 
@@ -272,8 +222,25 @@ mod tests {
         block_entity::init_block_entities,
         chunk::status::ChunkStatus,
         poi::PoiSquareColumns,
-        test_support::{block_pool, fresh_test_world, insert_ready_full_chunk},
+        test_support::{BlockedPool, fresh_test_world, insert_ready_full_chunk},
     };
+
+    use crate::chunk_saver::SavedPoi;
+
+    /// Unwraps each chunk's result; the tests here only save readable chunks.
+    fn readable(
+        by_chunk: Vec<(ChunkPos, io::Result<Vec<SavedPoi>>)>,
+    ) -> Vec<(ChunkPos, Vec<SavedPoi>)> {
+        by_chunk
+            .into_iter()
+            .map(|(chunk_pos, found)| {
+                (
+                    chunk_pos,
+                    found.expect("the saved chunk should be readable"),
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn ram_scan_runs_on_the_pool_without_holding_the_storage_lock() {
@@ -323,7 +290,7 @@ mod tests {
                 Ok(true)
             ));
 
-            let blocked = block_pool(&pool);
+            let blocked = BlockedPool::new(&pool);
             let scan = tokio::spawn({
                 let storage = Arc::clone(&storage);
                 let pool = Arc::clone(&pool);
@@ -332,6 +299,7 @@ mod tests {
                     storage
                         .saved_chunk_pois(&[chunk_pos], min_y, height, &pool, &cancelled)
                         .await
+                        .map(readable)
                 }
             });
 
@@ -359,7 +327,7 @@ mod tests {
             assert_eq!(found, [(chunk_pos, vec![(lodestone_pos, lodestone)])]);
 
             // A cancelled scan stops before scanning anything.
-            let _busy = block_pool(&pool);
+            let _busy = BlockedPool::new(&pool);
             let cancelled = Arc::new(AtomicBool::new(true));
             let positions = [chunk_pos];
             let scan = storage.saved_chunk_pois(&positions, min_y, height, &pool, &cancelled);
@@ -429,6 +397,7 @@ mod tests {
             ));
             disk.saved_chunk_pois(&[chunk_pos], min_y, height, &pool, &not_cancelled)
                 .await
+                .map(readable)
         });
         let _ = fs::remove_dir_all(&directory);
         let Ok(read) = read else {

@@ -175,8 +175,6 @@ impl BiomeSourceKind {
         result
     }
 
-    /// Vanilla's `BiomeSource.findClosestBiome3d`.
-    ///
     /// Walks a square spiral of sample columns around `origin`, testing the heights from
     /// [`out_from_origin`] in each, and returns the first possible biome `allowed` accepts.
     /// One sampler serves the whole search, like vanilla's per-search caching resolver.
