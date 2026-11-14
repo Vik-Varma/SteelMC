@@ -126,16 +126,13 @@ impl ItemBehavior for CompassItem {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::Arc,
-        thread,
-        time::{Duration, Instant},
-    };
+    use std::sync::Arc;
 
     use super::*;
     use crate::behavior::init_behaviors;
     use crate::entity::{Entity, LivingEntity};
     use crate::player::Player;
+    use crate::poi::test_helpers::{save_and_unload, wait_for_answer, wait_until};
     use crate::test_support::{
         BlockedPool, TestPlayerBuilder, fresh_test_world, insert_ready_full_chunk,
     };
@@ -270,25 +267,15 @@ mod tests {
     /// Ticks `player` until the selected compass's target is `expected`, failing after a few
     /// seconds. The compass checks unloaded targets in the background.
     fn tick_until_target(player: &Arc<Player>, expected: Option<BlockPos>) {
-        let started = Instant::now();
-        loop {
+        wait_until("the compass target", || {
             Arc::clone(player).tick();
-            let target = selected_target(player);
-            if target == expected {
-                return;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "the target stayed {target:?}, expected {expected:?}"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+            selected_target(player) == expected
+        });
     }
 
     #[test]
     fn compass_checks_targets_in_unloaded_chunks_against_their_save() {
         use crate::block_entity::init_block_entities;
-        use crate::poi::test_helpers::{save_and_unload, wait_for_answer};
 
         init_vanilla_registry();
         init_behaviors();

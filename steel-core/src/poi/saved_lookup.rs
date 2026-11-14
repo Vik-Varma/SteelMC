@@ -20,8 +20,7 @@ use crate::world::World;
 const ANSWER_REUSED_FOR: Duration = Duration::from_secs(5);
 /// How long a lookup may stay unfinished before another is started in its place.
 const LOOKUP_GIVEN_UP_AFTER: Duration = Duration::from_secs(30);
-/// Lookups this old are dropped once there are [`KEPT_LOOKUPS`] of them.
-const LOOKUP_DROPPED_AFTER: Duration = Duration::from_secs(60);
+/// Lookups that no longer answer are dropped once this many are kept.
 const KEPT_LOOKUPS: usize = 256;
 
 /// What is known about the POI at a position in a chunk not loaded as Full.
@@ -39,19 +38,21 @@ enum Lookup {
         started: Instant,
     },
     Finished {
-        poi_type: Option<usize>,
-        at: Instant,
-    },
-    Unreadable {
+        /// [`UnloadedPoi::Unknown`] when the chunk could not be read.
+        answer: UnloadedPoi,
         at: Instant,
     },
 }
 
 impl Lookup {
-    const fn at(self) -> Instant {
+    /// The answer to give at `now`, or `None` once the chunk should be read again.
+    fn answer(self, now: Instant) -> Option<UnloadedPoi> {
         match self {
-            Self::Running { started } => started,
-            Self::Finished { at, .. } | Self::Unreadable { at } => at,
+            Self::Running { started } => (now.duration_since(started) < LOOKUP_GIVEN_UP_AFTER)
+                .then_some(UnloadedPoi::Unknown),
+            Self::Finished { answer, at } => {
+                (now.duration_since(at) < ANSWER_REUSED_FOR).then_some(answer)
+            }
         }
     }
 }
@@ -85,31 +86,18 @@ impl World {
     pub(crate) fn unloaded_poi_type_at(&self, pos: BlockPos) -> UnloadedPoi {
         let now = Instant::now();
         let mut lookups = self.saved_poi_lookups.lookups.lock();
-        match lookups.get(&pos) {
-            Some(&Lookup::Finished { poi_type, at })
-                if now.duration_since(at) < ANSWER_REUSED_FOR =>
-            {
-                return UnloadedPoi::Known(poi_type);
-            }
-            Some(&Lookup::Unreadable { at }) if now.duration_since(at) < ANSWER_REUSED_FOR => {
-                return UnloadedPoi::Unknown;
-            }
-            Some(&Lookup::Running { started })
-                if now.duration_since(started) < LOOKUP_GIVEN_UP_AFTER =>
-            {
-                return UnloadedPoi::Unknown;
-            }
-            _ => {}
+        if let Some(answer) = lookups.get(&pos).and_then(|lookup| lookup.answer(now)) {
+            return answer;
         }
         if lookups.len() >= KEPT_LOOKUPS {
-            lookups.retain(|_, lookup| now.duration_since(lookup.at()) < LOOKUP_DROPPED_AFTER);
+            lookups.retain(|_, lookup| lookup.answer(now).is_some());
         }
         lookups.insert(pos, Lookup::Running { started: now });
         drop(lookups);
 
         let chunk_map = Arc::clone(&self.chunk_map);
         let lookups = self.saved_poi_lookups.clone();
-        let columns = PoiSquareColumns::single(&chunk_map, ChunkPos::from_block_pos(pos));
+        let columns = PoiSquareColumns::from_positions(&chunk_map, [ChunkPos::from_block_pos(pos)]);
         self.chunk_map.chunk_runtime.spawn(async move {
             let found = columns
                 .pois_by_chunk(
@@ -124,18 +112,20 @@ impl World {
                         .next()
                         .map_or(Ok(Vec::new()), |(_, found)| found)
                 });
-            let finished = match found {
-                Ok(found) => Lookup::Finished {
-                    poi_type: found
+            let answer = match found {
+                Ok(found) => UnloadedPoi::Known(
+                    found
                         .into_iter()
-                        .find(|&(poi_pos, _)| poi_pos == pos)
-                        .map(|(_, poi_type)| poi_type),
-                    at: Instant::now(),
-                },
+                        .find_map(|(poi_pos, poi_type)| (poi_pos == pos).then_some(poi_type)),
+                ),
                 Err(error) => {
                     tracing::warn!("Couldn't read the POIs of the chunk holding {pos:?}: {error}");
-                    Lookup::Unreadable { at: Instant::now() }
+                    UnloadedPoi::Unknown
                 }
+            };
+            let finished = Lookup::Finished {
+                answer,
+                at: Instant::now(),
             };
             lookups.record(pos, now, finished);
         });
@@ -199,33 +189,36 @@ pub(crate) mod test_helpers {
         world.poi_storage.lock().remove_chunk(chunk_pos);
     }
 
-    pub(crate) fn wait_for_answer(world: &World, pos: BlockPos) -> UnloadedPoi {
+    /// Polls `ready` every few milliseconds, failing after a few seconds.
+    pub(crate) fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
         let started = Instant::now();
-        loop {
-            let answer = world.unloaded_poi_type_at(pos);
-            if answer != UnloadedPoi::Unknown {
-                return answer;
-            }
+        while !ready() {
             assert!(
                 started.elapsed() < Duration::from_secs(5),
-                "no answer for {pos:?}"
+                "timed out waiting for {what}"
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    pub(crate) fn wait_for_answer(world: &World, pos: BlockPos) -> UnloadedPoi {
+        let mut answer = UnloadedPoi::Unknown;
+        wait_until("an answer", || {
+            answer = world.unloaded_poi_type_at(pos);
+            answer != UnloadedPoi::Unknown
+        });
+        answer
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        thread,
-        time::{Duration, Instant},
-    };
+    use std::time::Instant;
 
     use steel_registry::{RegistryEntry, init_vanilla_registry, vanilla_poi_types};
     use steel_utils::{BlockPos, ChunkPos};
 
-    use super::test_helpers::{save_and_unload, wait_for_answer};
+    use super::test_helpers::{save_and_unload, wait_for_answer, wait_until};
     use super::{ANSWER_REUSED_FOR, LOOKUP_GIVEN_UP_AFTER, Lookup, SavedPoiLookups, UnloadedPoi};
     use crate::{
         behavior::init_behaviors, block_entity::init_block_entities, test_support::fresh_test_world,
@@ -248,7 +241,7 @@ mod tests {
         world.saved_poi_lookups.lookups.lock().insert(
             lodestone,
             Lookup::Finished {
-                poi_type: None,
+                answer: UnloadedPoi::Known(None),
                 at: long_ago,
             },
         );
@@ -276,17 +269,12 @@ mod tests {
         });
 
         assert_eq!(world.unloaded_poi_type_at(target), UnloadedPoi::Unknown);
-        let started = Instant::now();
-        while !matches!(
-            world.saved_poi_lookups.lookups.lock().get(&target),
-            Some(Lookup::Unreadable { .. })
-        ) {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "the read never finished"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+        wait_until("the read to finish", || {
+            matches!(
+                world.saved_poi_lookups.lookups.lock().get(&target),
+                Some(Lookup::Finished { .. })
+            )
+        });
         assert_eq!(world.unloaded_poi_type_at(target), UnloadedPoi::Unknown);
     }
 
@@ -301,7 +289,7 @@ mod tests {
             .lock()
             .insert(pos, Lookup::Running { started: second });
         let late = Lookup::Finished {
-            poi_type: Some(7),
+            answer: UnloadedPoi::Known(Some(7)),
             at: second,
         };
 
@@ -314,7 +302,7 @@ mod tests {
         assert!(matches!(
             lookups.lookups.lock().get(&pos),
             Some(Lookup::Finished {
-                poi_type: Some(7),
+                answer: UnloadedPoi::Known(Some(7)),
                 ..
             })
         ));

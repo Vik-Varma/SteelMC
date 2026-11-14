@@ -225,12 +225,7 @@ mod tests {
     ) -> Vec<(ChunkPos, Vec<SavedPoi>)> {
         by_chunk
             .into_iter()
-            .map(|(chunk_pos, found)| {
-                (
-                    chunk_pos,
-                    found.expect("the saved chunk should be readable"),
-                )
-            })
+            .map(|(pos, found)| (pos, found.expect("the saved chunk should be readable")))
             .collect()
     }
 

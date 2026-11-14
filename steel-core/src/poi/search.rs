@@ -56,21 +56,18 @@ impl PoiSquareColumns {
         Self::from_positions(chunk_map, positions)
     }
 
-    /// Captures just `chunk_pos`.
-    #[must_use]
-    pub fn single(chunk_map: &Arc<ChunkMap>, chunk_pos: ChunkPos) -> Self {
-        Self::from_positions(chunk_map, [chunk_pos])
-    }
-
-    fn from_positions(
+    /// Captures the chunks at `positions`, in order.
+    pub(crate) fn from_positions(
         chunk_map: &Arc<ChunkMap>,
         positions: impl IntoIterator<Item = ChunkPos>,
     ) -> Self {
         let columns = positions
             .into_iter()
             .map(|pos| {
-                let holder = chunk_map.current_holder(pos);
-                (pos, holder.map(|holder| Arc::downgrade(&holder)))
+                (
+                    pos,
+                    chunk_map.current_holder(pos).as_ref().map(Arc::downgrade),
+                )
             })
             .collect();
         Self {
