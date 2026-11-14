@@ -46,35 +46,35 @@ impl PoiSquareColumns {
     /// (x fastest, then z).
     #[must_use]
     pub fn capture(chunk_map: &Arc<ChunkMap>, center: BlockPos, radius: i32) -> Self {
-        let center_chunk = ChunkPos::from_block_pos(center);
+        let center = ChunkPos::from_block_pos(center);
         let chunk_radius = radius.div_euclid(16) + 1;
-        let side = (2 * chunk_radius + 1) as usize;
-        let mut columns = Vec::with_capacity(side * side);
-        for z in center_chunk.0.y - chunk_radius..=center_chunk.0.y + chunk_radius {
-            for x in center_chunk.0.x - chunk_radius..=center_chunk.0.x + chunk_radius {
-                let pos = ChunkPos::new(x, z);
-                let holder = chunk_map
-                    .current_holder(pos)
-                    .map(|holder| Arc::downgrade(&holder));
-                columns.push((pos, holder));
-            }
-        }
-        Self {
-            columns,
-            chunk_map: Arc::downgrade(chunk_map),
-            min_y: chunk_map.world_gen_context.min_y(),
-            height: chunk_map.world_gen_context.height(),
-        }
+        let rows = center.0.y - chunk_radius..=center.0.y + chunk_radius;
+        let positions = rows.flat_map(|z| {
+            (center.0.x - chunk_radius..=center.0.x + chunk_radius)
+                .map(move |x| ChunkPos::new(x, z))
+        });
+        Self::from_positions(chunk_map, positions)
     }
 
-    /// Captures the one chunk at `chunk_pos`.
+    /// Captures just `chunk_pos`.
     #[must_use]
     pub fn single(chunk_map: &Arc<ChunkMap>, chunk_pos: ChunkPos) -> Self {
-        let holder = chunk_map
-            .current_holder(chunk_pos)
-            .map(|holder| Arc::downgrade(&holder));
+        Self::from_positions(chunk_map, [chunk_pos])
+    }
+
+    fn from_positions(
+        chunk_map: &Arc<ChunkMap>,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Self {
+        let columns = positions
+            .into_iter()
+            .map(|pos| {
+                let holder = chunk_map.current_holder(pos);
+                (pos, holder.map(|holder| Arc::downgrade(&holder)))
+            })
+            .collect();
         Self {
-            columns: vec![(chunk_pos, holder)],
+            columns,
             chunk_map: Arc::downgrade(chunk_map),
             min_y: chunk_map.world_gen_context.min_y(),
             height: chunk_map.world_gen_context.height(),

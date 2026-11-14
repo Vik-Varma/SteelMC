@@ -12,5 +12,7 @@ pub mod search;
 pub use poi_instance::PointOfInterest;
 pub use poi_set::PointOfInterestSet;
 pub use poi_storage::{OccupationStatus, PointOfInterestStorage};
+#[cfg(test)]
+pub(crate) use saved_lookup::test_helpers;
 pub(crate) use saved_lookup::{SavedPoiLookups, UnloadedPoi};
 pub use search::{PoiSquareColumns, find_closest_with_type};

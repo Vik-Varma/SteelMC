@@ -258,18 +258,22 @@ mod tests {
         );
     }
 
+    fn selected_target(player: &Player) -> Option<BlockPos> {
+        player
+            .inventory
+            .lock()
+            .get_selected_item()
+            .get(LODESTONE_TRACKER)
+            .and_then(|tracker| tracker.target().map(GlobalPos::pos))
+    }
+
     /// Ticks `player` until the selected compass's target is `expected`, failing after a few
     /// seconds. The compass checks unloaded targets in the background.
     fn tick_until_target(player: &Arc<Player>, expected: Option<BlockPos>) {
         let started = Instant::now();
         loop {
             Arc::clone(player).tick();
-            let target = player
-                .inventory
-                .lock()
-                .get_selected_item()
-                .get(LODESTONE_TRACKER)
-                .and_then(|tracker| tracker.target().map(GlobalPos::pos));
+            let target = selected_target(player);
             if target == expected {
                 return;
             }
@@ -284,41 +288,15 @@ mod tests {
     #[test]
     fn compass_checks_targets_in_unloaded_chunks_against_their_save() {
         use crate::block_entity::init_block_entities;
-        use crate::chunk::status::ChunkStatus;
-        use crate::chunk_saver::ChunkStorage;
+        use crate::poi::test_helpers::{save_and_unload, wait_for_answer};
 
         init_vanilla_registry();
         init_behaviors();
         init_block_entities();
         let world_fixture = fresh_test_world("compass_unloaded_target");
         let world = &world_fixture.world;
-
-        // Save a chunk holding a lodestone, then unload it.
-        let saved_chunk = ChunkPos::new(2, 0);
         let lodestone = BlockPos::new(40, 70, 2);
-        let holder = insert_ready_full_chunk(world, saved_chunk);
-        assert!(world.set_block(
-            lodestone,
-            vanilla_blocks::LODESTONE.default_state(),
-            UpdateFlags::UPDATE_ALL
-        ));
-        let Some(chunk) = holder.try_chunk(ChunkStatus::Full) else {
-            panic!("inserted chunk should be Full");
-        };
-        let Some(prepared) = ChunkStorage::prepare_chunk_save(chunk, ChunkStatus::Full, &[], true)
-        else {
-            panic!("a forced save should be prepared");
-        };
-        let saved = world.chunk_map.chunk_runtime.block_on(
-            world
-                .chunk_map
-                .storage
-                .save_chunk_data(prepared, &world.chunk_map.generation_pool),
-        );
-        assert!(matches!(saved, Ok(true)));
-        let _ = world.chunk_map.chunks.remove_sync(&saved_chunk);
-        world.poi_storage.lock().remove_chunk(saved_chunk);
-        drop(holder);
+        save_and_unload(world, ChunkPos::new(2, 0), Some(lodestone), |_| {});
         assert!(!world.is_full_chunk_loaded_at(lodestone));
 
         let player = TestPlayerBuilder::new(Arc::clone(world), "CompassTester", 1)
@@ -333,38 +311,25 @@ mod tests {
             compass
         };
 
-        // The saved lodestone keeps its compass, both while the chunk is read and after.
+        // The saved lodestone keeps its compass while the chunk is read...
         player
             .inventory
             .lock()
             .set_selected_item(compass_for(lodestone));
         {
-            // Hold the read back so these ticks find it still running.
             let _blocked = BlockedPool::new(&world.chunk_map.generation_pool);
             for _ in 0..5 {
-                tick_until_target(&player, Some(lodestone));
+                Arc::clone(&player).tick();
+                assert_eq!(selected_target(&player), Some(lodestone));
             }
         }
-        for _ in 0..20 {
-            tick_until_target(&player, Some(lodestone));
-            thread::sleep(Duration::from_millis(5));
-        }
-        // The read found the saved lodestone.
-        let started = Instant::now();
-        let lodestone_type = vanilla_poi_types::LODESTONE.try_id();
-        loop {
-            match world.unloaded_poi_type_at(lodestone) {
-                UnloadedPoi::Known(found) => {
-                    assert_eq!(found, lodestone_type);
-                    break;
-                }
-                UnloadedPoi::Unknown => {
-                    assert!(started.elapsed() < Duration::from_secs(5));
-                    thread::sleep(Duration::from_millis(5));
-                }
-            }
-        }
-        tick_until_target(&player, Some(lodestone));
+        // ...and once the read finds it.
+        assert_eq!(
+            wait_for_answer(world, lodestone),
+            UnloadedPoi::Known(vanilla_poi_types::LODESTONE.try_id())
+        );
+        Arc::clone(&player).tick();
+        assert_eq!(selected_target(&player), Some(lodestone));
 
         // No lodestone is saved at this position of the same chunk.
         let beside = BlockPos::new(41, 70, 2);
@@ -373,14 +338,8 @@ mod tests {
             .lock()
             .set_selected_item(compass_for(beside));
         Arc::clone(&player).tick();
-        let kept = player
-            .inventory
-            .lock()
-            .get_selected_item()
-            .get(LODESTONE_TRACKER)
-            .and_then(|tracker| tracker.target().map(GlobalPos::pos));
         assert_eq!(
-            kept,
+            selected_target(&player),
             Some(beside),
             "the target is kept until the read finishes"
         );

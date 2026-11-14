@@ -20,7 +20,7 @@ use crate::world::World;
 const ANSWER_REUSED_FOR: Duration = Duration::from_secs(5);
 /// How long a lookup may stay unfinished before another is started in its place.
 const LOOKUP_GIVEN_UP_AFTER: Duration = Duration::from_secs(30);
-/// Lookups this old are dropped once [`KEPT_LOOKUPS`] are kept.
+/// Lookups this old are dropped once there are [`KEPT_LOOKUPS`] of them.
 const LOOKUP_DROPPED_AFTER: Duration = Duration::from_secs(60);
 const KEPT_LOOKUPS: usize = 256;
 
@@ -57,24 +57,31 @@ impl Lookup {
 }
 
 /// Per-world record of POI lookups in chunks not loaded as Full.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct SavedPoiLookups {
     lookups: Arc<SyncMutex<FxHashMap<BlockPos, Lookup>>>,
 }
 
+impl SavedPoiLookups {
+    /// Records the result of the lookup at `pos` started at `started`, unless a lookup started
+    /// after it was given up on owns the entry now.
+    fn record(&self, pos: BlockPos, started: Instant, finished: Lookup) {
+        let mut lookups = self.lookups.lock();
+        if let Some(lookup) = lookups.get_mut(&pos)
+            && matches!(*lookup, Lookup::Running { started: current } if current == started)
+        {
+            *lookup = finished;
+        }
+    }
+}
+
 impl World {
-    /// The POI type at `pos`, which must be in a chunk not loaded as Full, as vanilla's
-    /// `PoiManager` would load it: from the chunk's blocks if it is in memory at a lower
-    /// status, otherwise from its save. A chunk that was never saved has no POIs.
+    /// The POI type at `pos`, in a chunk not loaded as Full: [`UnloadedPoi::Unknown`] while
+    /// the chunk is read in the background, then its answer for a few seconds, after which
+    /// the chunk is read again.
     ///
-    /// Returns [`UnloadedPoi::Unknown`] while the chunk is being read, and starts that read.
-    /// An answer is given for a few seconds, then the chunk is read again; answers are never
-    /// given once stale, since the chunk may have been loaded and changed meanwhile.
-    ///
-    /// Unlike vanilla, which treats POI data it cannot read as empty, a chunk that cannot be
-    /// read stays [`UnloadedPoi::Unknown`] and is read again later: Steel refuses a whole
-    /// region when part of its table is damaged, so treating that as empty would discard
-    /// answers for every chunk in it.
+    /// Unlike vanilla, which treats POI data it cannot read as empty, an unreadable chunk
+    /// stays `Unknown`: Steel refuses a whole region when part of its table is damaged.
     pub(crate) fn unloaded_poi_type_at(&self, pos: BlockPos) -> UnloadedPoi {
         let now = Instant::now();
         let mut lookups = self.saved_poi_lookups.lookups.lock();
@@ -101,7 +108,7 @@ impl World {
         drop(lookups);
 
         let chunk_map = Arc::clone(&self.chunk_map);
-        let lookups = Arc::clone(&self.saved_poi_lookups.lookups);
+        let lookups = self.saved_poi_lookups.clone();
         let columns = PoiSquareColumns::single(&chunk_map, ChunkPos::from_block_pos(pos));
         self.chunk_map.chunk_runtime.spawn(async move {
             let found = columns
@@ -130,51 +137,35 @@ impl World {
                     Lookup::Unreadable { at: Instant::now() }
                 }
             };
-            record(&mut lookups.lock(), pos, now, finished);
+            lookups.record(pos, now, finished);
         });
         UnloadedPoi::Unknown
     }
 }
 
-/// Records the result of the lookup at `pos` started at `started`, unless a lookup started
-/// after it was given up on owns the entry now.
-fn record(
-    lookups: &mut FxHashMap<BlockPos, Lookup>,
-    pos: BlockPos,
-    started: Instant,
-    finished: Lookup,
-) {
-    if matches!(lookups.get(&pos), Some(&Lookup::Running { started: current }) if current == started)
-    {
-        lookups.insert(pos, finished);
-    }
-}
-
+/// Helpers for tests reading POIs of unloaded chunks.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_helpers {
     use std::{
         sync::Arc,
         thread,
         time::{Duration, Instant},
     };
 
-    use rustc_hash::FxHashMap;
-    use steel_registry::{RegistryEntry, init_vanilla_registry, vanilla_blocks, vanilla_poi_types};
+    use steel_registry::vanilla_blocks;
     use steel_utils::{BlockPos, ChunkPos, types::UpdateFlags};
 
-    use super::{Lookup, UnloadedPoi, record};
+    use super::UnloadedPoi;
     use crate::{
-        behavior::init_behaviors,
-        block_entity::init_block_entities,
         chunk::status::ChunkStatus,
         chunk_saver::{ChunkStorage, PreparedChunkSave},
-        test_support::{fresh_test_world, insert_ready_full_chunk},
+        test_support::insert_ready_full_chunk,
         world::World,
     };
 
     /// Saves a Full chunk at `chunk_pos`, after `edit` changes what is saved, then drops it
     /// from memory.
-    fn save_and_unload(
+    pub(crate) fn save_and_unload(
         world: &Arc<World>,
         chunk_pos: ChunkPos,
         lodestone: Option<BlockPos>,
@@ -208,7 +199,7 @@ mod tests {
         world.poi_storage.lock().remove_chunk(chunk_pos);
     }
 
-    fn wait_for_answer(world: &World, pos: BlockPos) -> UnloadedPoi {
+    pub(crate) fn wait_for_answer(world: &World, pos: BlockPos) -> UnloadedPoi {
         let started = Instant::now();
         loop {
             let answer = world.unloaded_poi_type_at(pos);
@@ -222,6 +213,23 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use steel_registry::{RegistryEntry, init_vanilla_registry, vanilla_poi_types};
+    use steel_utils::{BlockPos, ChunkPos};
+
+    use super::test_helpers::{save_and_unload, wait_for_answer};
+    use super::{ANSWER_REUSED_FOR, LOOKUP_GIVEN_UP_AFTER, Lookup, SavedPoiLookups, UnloadedPoi};
+    use crate::{
+        behavior::init_behaviors, block_entity::init_block_entities, test_support::fresh_test_world,
+    };
 
     #[test]
     fn a_stale_answer_is_never_given_while_the_chunk_is_read_again() {
@@ -235,8 +243,8 @@ mod tests {
 
         // An answer from before the lodestone was placed has expired.
         let long_ago = Instant::now()
-            .checked_sub(Duration::from_secs(60))
-            .expect("the clock is past a minute");
+            .checked_sub(ANSWER_REUSED_FOR)
+            .expect("the clock is past the reuse window");
         world.saved_poi_lookups.lookups.lock().insert(
             lodestone,
             Lookup::Finished {
@@ -286,19 +294,25 @@ mod tests {
     fn a_lookup_given_up_on_cannot_overwrite_the_one_that_replaced_it() {
         let pos = BlockPos::new(1, 2, 3);
         let first = Instant::now();
-        let second = first + Duration::from_secs(31);
-        let mut lookups = FxHashMap::default();
-        lookups.insert(pos, Lookup::Running { started: second });
+        let second = first + LOOKUP_GIVEN_UP_AFTER;
+        let lookups = SavedPoiLookups::default();
+        lookups
+            .lookups
+            .lock()
+            .insert(pos, Lookup::Running { started: second });
         let late = Lookup::Finished {
             poi_type: Some(7),
             at: second,
         };
 
-        record(&mut lookups, pos, first, late);
-        assert!(matches!(lookups.get(&pos), Some(Lookup::Running { .. })));
-        record(&mut lookups, pos, second, late);
+        lookups.record(pos, first, late);
         assert!(matches!(
-            lookups.get(&pos),
+            lookups.lookups.lock().get(&pos),
+            Some(Lookup::Running { .. })
+        ));
+        lookups.record(pos, second, late);
+        assert!(matches!(
+            lookups.lookups.lock().get(&pos),
             Some(Lookup::Finished {
                 poi_type: Some(7),
                 ..
