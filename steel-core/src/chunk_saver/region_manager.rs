@@ -31,7 +31,7 @@ use super::{
     ChunkStorage, LoadedChunk, PersistentChunk,
     format::{
         CHUNK_TABLE_SIZE, ChunkEntry, FILE_HEADER_SIZE, FIRST_DATA_SECTOR, FORMAT_VERSION,
-        MAX_CHUNK_SIZE, REGION_MAGIC, RegionHeader, RegionPos, SECTOR_SIZE,
+        MAX_CHUNK_SIZE, REGION_MAGIC, RegionHeader, RegionPos, SECTOR_SIZE, TOTAL_HEADER_SIZE,
     },
 };
 
@@ -84,7 +84,8 @@ impl UnopenedRegion {
         };
         // Chunk data starts after the chunk table, so a file too short to hold the table (as a
         // crash while creating it leaves) holds no chunks.
-        if file.metadata()?.len() < (FILE_HEADER_SIZE + CHUNK_TABLE_SIZE) as u64 {
+        let file_size = file.metadata()?.len();
+        if file_size < TOTAL_HEADER_SIZE as u64 {
             return Ok(Self::Absent);
         }
         let mut file_header = [0u8; FILE_HEADER_SIZE];
@@ -103,13 +104,8 @@ impl UnopenedRegion {
         // loading could not.
         let mut table_bytes = vec![0u8; CHUNK_TABLE_SIZE];
         file.read_exact(&mut table_bytes)?;
-        let header = RegionHeader::from_bytes(&table_bytes).map_err(|index| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("region chunk table entry {index} has an invalid status byte"),
-            )
-        })?;
-        let file_sectors = file.metadata()?.len().div_ceil(SECTOR_SIZE as u64) as u32;
+        let header = RegionManager::parse_chunk_table(&table_bytes)?;
+        let file_sectors = file_size.div_ceil(SECTOR_SIZE as u64) as u32;
         RegionManager::validate_region_entries(&header, file_sectors)?;
         Ok(Self::Readable(file))
     }
@@ -191,12 +187,7 @@ impl RegionManager {
         // Read chunk table
         let mut table_bytes = vec![0u8; CHUNK_TABLE_SIZE];
         file.read_exact(&mut table_bytes).await?;
-        let header = RegionHeader::from_bytes(&table_bytes).map_err(|index| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("region chunk table entry {index} has an invalid status byte"),
-            )
-        })?;
+        let header = Self::parse_chunk_table(&table_bytes)?;
 
         // Calculate file size in sectors
         let file_size = file.seek(io::SeekFrom::End(0)).await?;
@@ -266,6 +257,15 @@ impl RegionManager {
         let mut compressed = vec![0u8; size as usize];
         file.read_exact(&mut compressed).await?;
         Ok(compressed)
+    }
+
+    fn parse_chunk_table(table_bytes: &[u8]) -> io::Result<RegionHeader> {
+        RegionHeader::from_bytes(table_bytes).map_err(|index| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("region chunk table entry {index} has an invalid status byte"),
+            )
+        })
     }
 
     fn validate_chunk_entry(entry: ChunkEntry, file_sectors: u32) -> io::Result<()> {
@@ -846,7 +846,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::chunk_saver::{PersistentChunk, PersistentLightData};
+    use crate::chunk_saver::PersistentChunk;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -962,22 +962,7 @@ mod tests {
     async fn semantically_invalid_complete_payload_is_removed_for_regeneration() {
         let directory = test_directory("semantic");
         let pos = ChunkPos::new(0, 0);
-        let persistent = PersistentChunk {
-            last_modified: 0,
-            block_states: Vec::new(),
-            biomes: Vec::new(),
-            sections: Vec::new(),
-            block_entities: Vec::new(),
-            entities: Vec::new(),
-            block_ticks: Vec::new(),
-            fluid_ticks: Vec::new(),
-            heightmaps: Vec::new(),
-            light: PersistentLightData::default(),
-            postprocessing: Vec::new(),
-            structure_starts: Vec::new(),
-            structure_references: Vec::new(),
-            pois: Vec::new(),
-        };
+        let persistent = PersistentChunk::default();
         let encoded = wincode::serialize(&persistent).expect("test chunk should encode");
         let payload = zstd::encode_all(encoded.as_slice(), 1).expect("test chunk should compress");
         write_test_region(&directory, pos, &payload, payload.len() as u32)
@@ -1187,22 +1172,7 @@ mod tests {
         PreparedChunkSave {
             pos,
             status: ChunkStatus::Full,
-            persistent: PersistentChunk {
-                last_modified: 0,
-                block_states: Vec::new(),
-                biomes: Vec::new(),
-                sections: Vec::new(),
-                block_entities: Vec::new(),
-                entities: Vec::new(),
-                block_ticks: Vec::new(),
-                fluid_ticks: Vec::new(),
-                heightmaps: Vec::new(),
-                light: PersistentLightData::default(),
-                postprocessing: Vec::new(),
-                structure_starts: Vec::new(),
-                structure_references: Vec::new(),
-                pois: Vec::new(),
-            },
+            persistent: PersistentChunk::default(),
             handled_runtime_entity_ids: Vec::new(),
         }
     }

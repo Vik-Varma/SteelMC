@@ -11,6 +11,7 @@ mod permission;
 mod poi_type;
 mod profile;
 mod queue;
+mod resource_or_tag;
 mod runtime;
 mod score;
 mod selector;

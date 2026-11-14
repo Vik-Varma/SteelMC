@@ -726,6 +726,17 @@ impl SectionPos {
         self.0.z
     }
 
+    /// The block at `index` of this section, with indices in y, z, x order.
+    #[must_use]
+    pub const fn block_at_index(&self, index: usize) -> BlockPos {
+        let index = index as i32;
+        BlockPos::new(
+            (self.0.x << Self::SECTION_BITS) + (index & Self::SECTION_MASK),
+            (self.0.y << Self::SECTION_BITS) + (index >> (2 * Self::SECTION_BITS)),
+            (self.0.z << Self::SECTION_BITS) + ((index >> Self::SECTION_BITS) & Self::SECTION_MASK),
+        )
+    }
+
     /// Converts section-relative coordinates to an absolute block X coordinate.
     #[must_use]
     pub const fn relative_to_block_x(&self, relative: PackedSectionBlockPos) -> i32 {

@@ -53,7 +53,9 @@ impl PoiSquareColumns {
         for z in center_chunk.0.y - chunk_radius..=center_chunk.0.y + chunk_radius {
             for x in center_chunk.0.x - chunk_radius..=center_chunk.0.x + chunk_radius {
                 let pos = ChunkPos::new(x, z);
-                let holder = current_holder(chunk_map, pos).map(|holder| Arc::downgrade(&holder));
+                let holder = chunk_map
+                    .current_holder(pos)
+                    .map(|holder| Arc::downgrade(&holder));
                 columns.push((pos, holder));
             }
         }
@@ -91,7 +93,7 @@ impl PoiSquareColumns {
                 }
                 let holder = chunk_map
                     .as_deref()
-                    .and_then(|chunk_map| current_holder(chunk_map, chunk_pos))
+                    .and_then(|chunk_map| chunk_map.current_holder(chunk_pos))
                     .or_else(|| holder.and_then(|holder| holder.upgrade()));
                 let in_memory = holder.and_then(|holder| {
                     let chunk = holder.try_chunk(ChunkStatus::Empty)?;
@@ -128,20 +130,8 @@ impl PoiSquareColumns {
     }
 }
 
-/// The holder at `pos`, active or pending unload.
-fn current_holder(chunk_map: &ChunkMap, pos: ChunkPos) -> Option<Arc<ChunkHolder>> {
-    chunk_map
-        .chunks
-        .read_sync(&pos, |_, holder| Arc::clone(holder))
-        .or_else(|| {
-            chunk_map
-                .unloading_chunks
-                .read_sync(&pos, |_, holder| Arc::clone(holder))
-        })
-}
-
 fn in_memory_pois(chunk: &Chunk, chunk_pos: ChunkPos) -> Vec<SavedPoi> {
-    let min_section_y = chunk.min_y() >> 4;
+    let min_section_y = SectionPos::block_to_section_coord(chunk.min_y());
     let mut found = Vec::new();
     for (index, section) in chunk.sections().sections.iter().enumerate() {
         let section = section.read();
@@ -166,25 +156,17 @@ pub fn find_closest_with_type(
     radius: i32,
 ) -> Option<SavedPoi> {
     let radius_sqr = f64::from(radius * radius);
-    let mut closest: Option<(f64, SavedPoi)> = None;
-    for (pos, poi_type) in pois {
-        if !matches(poi_type)
-            || (pos.x() - center.x()).abs() > radius
-            || (pos.z() - center.z()).abs() > radius
-        {
-            continue;
-        }
-        let dx = f64::from(pos.x()) - f64::from(center.x());
-        let dy = f64::from(pos.y()) - f64::from(center.y());
-        let dz = f64::from(pos.z()) - f64::from(center.z());
-        let distance_sqr = dx * dx + dy * dy + dz * dz;
-        if distance_sqr <= radius_sqr
-            && closest.is_none_or(|(closest_sqr, _)| distance_sqr < closest_sqr)
-        {
-            closest = Some((distance_sqr, (pos, poi_type)));
-        }
-    }
-    closest.map(|(_, poi)| poi)
+    pois.into_iter()
+        .filter(|&(pos, poi_type)| {
+            matches(poi_type)
+                && (pos.x() - center.x()).abs() <= radius
+                && (pos.z() - center.z()).abs() <= radius
+        })
+        .map(|poi| (poi.0.dist_sqr(center), poi))
+        .filter(|&(distance_sqr, _)| distance_sqr <= radius_sqr)
+        // `min_by` keeps the first of equal minima.
+        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+        .map(|(_, poi)| poi)
 }
 
 #[cfg(test)]

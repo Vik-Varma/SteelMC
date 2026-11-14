@@ -9,13 +9,13 @@ use std::{
 };
 
 use steel_registry::REGISTRY;
-use steel_utils::{BlockPos, ChunkPos};
+use steel_utils::{BlockPos, ChunkPos, SectionPos};
 use tokio::sync::oneshot;
 
 use super::super::{
     SimpleRAMChunk,
     bit_pack::unpack_indices,
-    format::{PersistentChunk, PersistentSection},
+    format::{BLOCKS_PER_SECTION, PersistentChunk, PersistentSection},
 };
 use super::ChunkStorage;
 
@@ -146,21 +146,7 @@ impl ChunkStorage {
         min_y: i32,
         height: i32,
     ) -> io::Result<Vec<SavedPoi>> {
-        if height <= 0 || height % 16 != 0 || min_y % 16 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "chunk world range must be section-aligned, got min_y={min_y}, height={height}"
-                ),
-            ));
-        }
-        let expected_sections = (height / 16) as usize;
-        if persistent.sections.len() != expected_sections {
-            return Err(Self::invalid_chunk_data(format!(
-                "chunk has {} sections, expected {expected_sections}",
-                persistent.sections.len()
-            )));
-        }
+        Self::validate_section_layout(persistent, min_y, height)?;
 
         let mut palette_types: Vec<Option<Option<usize>>> =
             vec![None; persistent.block_states.len()];
@@ -177,17 +163,19 @@ impl ChunkStorage {
         };
 
         let mut pois = Vec::new();
+        let min_section_y = SectionPos::block_to_section_coord(min_y);
         for (section_index, section) in persistent.sections.iter().enumerate() {
-            let origin = BlockPos::new(
-                chunk_pos.0.x * 16,
-                min_y + section_index as i32 * 16,
-                chunk_pos.0.y * 16,
+            let section_pos = SectionPos::new(
+                chunk_pos.0.x,
+                min_section_y + section_index as i32,
+                chunk_pos.0.y,
             );
             match section {
                 PersistentSection::Homogeneous { block_state, .. } => {
                     if let Some(poi_type) = poi_type_at(*block_state)? {
                         pois.extend(
-                            (0..4096).map(|index| (section_offset(origin, index), poi_type)),
+                            (0..BLOCKS_PER_SECTION)
+                                .map(|index| (section_pos.block_at_index(index), poi_type)),
                         );
                     }
                 }
@@ -208,14 +196,15 @@ impl ChunkStorage {
                         palette,
                         *bits_per_entry,
                         block_data,
-                        4096,
+                        BLOCKS_PER_SECTION,
                         persistent.block_states.len(),
                         "block-state",
                     )?;
-                    let indices = unpack_indices(block_data, *bits_per_entry).take(4096);
+                    let indices =
+                        unpack_indices(block_data, *bits_per_entry).take(BLOCKS_PER_SECTION);
                     for (index, palette_index) in indices.enumerate() {
                         if let Some(poi_type) = section_types[palette_index as usize] {
-                            pois.push((section_offset(origin, index), poi_type));
+                            pois.push((section_pos.block_at_index(index), poi_type));
                         }
                     }
                 }
@@ -223,12 +212,6 @@ impl ChunkStorage {
         }
         Ok(pois)
     }
-}
-
-/// The block at `index` of a section stored in y, z, x order.
-const fn section_offset(origin: BlockPos, index: usize) -> BlockPos {
-    let index = index as i32;
-    origin.offset(index & 15, index >> 8, (index >> 4) & 15)
 }
 
 #[cfg(test)]

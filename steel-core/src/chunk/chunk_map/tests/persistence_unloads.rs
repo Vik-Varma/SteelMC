@@ -2,7 +2,11 @@ use super::*;
 use crate::chunk::chunk_holder::ChunkSavePreparationGuard;
 use crate::chunk::chunk_pyramid::GENERATION_PYRAMID;
 use crate::chunk::chunk_request::{ChunkRequest, ChunkTicketKind};
+use crate::chunk_saver::SavedPoi;
+use crate::poi::PoiSquareColumns;
+use std::sync::atomic::AtomicBool;
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Unloads a ready Full holder at `pos` and reserves its save preparation.
 fn unloading_holder_with_save_preparation(
@@ -334,12 +338,42 @@ fn gameplay_cache_scopes_observe_a_full_holder_revived_between_phases() {
     stop_chunk_tasks(world);
 }
 
+/// Unloads `holder`'s chunk and waits until it is saved and finalized.
+fn unload_until_finalized(world: &Arc<World>, chunk_pos: ChunkPos, holder: Arc<ChunkHolder>) {
+    world.chunk_map.update_chunk_level(chunk_pos, None);
+    world.chunk_map.rebuild_ticking_chunk_snapshot();
+    drop(holder);
+    let started = Instant::now();
+    let _runtime_guard = world.chunk_map.chunk_runtime.enter();
+    while world.chunk_map.unloading_chunks.contains_sync(&chunk_pos) {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the chunk should finish unloading"
+        );
+        world.chunk_map.process_unloads();
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn scan(world: &World, columns: PoiSquareColumns) -> Vec<SavedPoi> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("test pool should build");
+    world
+        .chunk_map
+        .chunk_runtime
+        .block_on(columns.pois(
+            &world.chunk_map.storage,
+            &pool,
+            &Arc::new(AtomicBool::new(false)),
+        ))
+        .expect("the search should succeed")
+}
+
 #[test]
 fn pending_poi_search_does_not_pin_captured_chunks() {
     use crate::block_entity::init_block_entities;
-    use crate::poi::PoiSquareColumns;
-    use std::sync::atomic::AtomicBool;
-    use std::time::{Duration, Instant};
     use steel_registry::{RegistryEntry as _, vanilla_poi_types};
 
     init_vanilla_registry();
@@ -361,21 +395,7 @@ fn pending_poi_search_does_not_pin_captured_chunks() {
 
     // The captured chunk still saves and finalizes while the search is pending.
     let captured = Arc::downgrade(&holder);
-    world.chunk_map.update_chunk_level(chunk_pos, None);
-    world.chunk_map.rebuild_ticking_chunk_snapshot();
-    drop(holder);
-    let started = Instant::now();
-    {
-        let _runtime_guard = world.chunk_map.chunk_runtime.enter();
-        while world.chunk_map.unloading_chunks.contains_sync(&chunk_pos) {
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "the captured chunk should finish unloading"
-            );
-            world.chunk_map.process_unloads();
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
+    unload_until_finalized(world, chunk_pos, holder);
 
     // Once the next tick releases the finalized holder, its POIs come from storage.
     world.chunk_map.finish_block_entity_unloads();
@@ -383,19 +403,7 @@ fn pending_poi_search_does_not_pin_captured_chunks() {
         captured.upgrade().is_none(),
         "the finalized holder should be gone"
     );
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .expect("test pool should build");
-    let found = world
-        .chunk_map
-        .chunk_runtime
-        .block_on(columns.pois(
-            &world.chunk_map.storage,
-            &pool,
-            &Arc::new(AtomicBool::new(false)),
-        ))
-        .expect("the search should read the saved chunk");
+    let found = scan(world, columns);
     let lodestone = vanilla_poi_types::LODESTONE
         .try_id()
         .expect("vanilla lodestone POI type should be registered");
@@ -406,9 +414,6 @@ fn pending_poi_search_does_not_pin_captured_chunks() {
 #[test]
 fn poi_search_reads_a_chunk_reloaded_after_capture_live() {
     use crate::block_entity::init_block_entities;
-    use crate::poi::PoiSquareColumns;
-    use std::sync::atomic::AtomicBool;
-    use std::time::{Duration, Instant};
     use steel_registry::{RegistryEntry as _, vanilla_poi_types};
 
     init_vanilla_registry();
@@ -428,21 +433,7 @@ fn poi_search_reads_a_chunk_reloaded_after_capture_live() {
     let columns = PoiSquareColumns::capture(&world.chunk_map, BlockPos::new(0, 64, 0), 16);
 
     // The captured holder unloads (saving the lodestone) and is finalized...
-    world.chunk_map.update_chunk_level(chunk_pos, None);
-    world.chunk_map.rebuild_ticking_chunk_snapshot();
-    drop(holder);
-    let started = Instant::now();
-    {
-        let _runtime_guard = world.chunk_map.chunk_runtime.enter();
-        while world.chunk_map.unloading_chunks.contains_sync(&chunk_pos) {
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "the captured chunk should finish unloading"
-            );
-            world.chunk_map.process_unloads();
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
+    unload_until_finalized(world, chunk_pos, holder);
     // ...then a new holder takes its place and gains a bell that is not saved yet.
     insert_ready_full_chunk(world, chunk_pos);
     let bell_pos = BlockPos::new(9, 64, 12);
@@ -452,19 +443,7 @@ fn poi_search_reads_a_chunk_reloaded_after_capture_live() {
         UpdateFlags::UPDATE_ALL,
     ));
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .expect("test pool should build");
-    let found = world
-        .chunk_map
-        .chunk_runtime
-        .block_on(columns.pois(
-            &world.chunk_map.storage,
-            &pool,
-            &Arc::new(AtomicBool::new(false)),
-        ))
-        .expect("the search should succeed");
+    let found = scan(world, columns);
     let meeting = vanilla_poi_types::MEETING
         .try_id()
         .expect("vanilla meeting POI type should be registered");
