@@ -105,18 +105,10 @@ impl ChunkStorage {
         min_y: i32,
         height: i32,
     ) -> io::Result<Vec<SavedPoi>> {
-        let data = zstd::decode_all(compressed).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("zstd decode failed: {error}"),
-            )
-        })?;
-        let persistent: PersistentChunk<'_> = wincode::deserialize(&data).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("chunk decode failed: {error}"),
-            )
-        })?;
+        let data = zstd::decode_all(compressed)
+            .map_err(|error| Self::invalid_chunk_data(format!("zstd decode failed: {error}")))?;
+        let persistent: PersistentChunk<'_> = wincode::deserialize(&data)
+            .map_err(|error| Self::invalid_chunk_data(format!("chunk decode failed: {error}")))?;
         Self::persistent_pois(&persistent, chunk_pos, min_y, height)
     }
 
@@ -222,7 +214,7 @@ mod tests {
         block_entity::init_block_entities,
         chunk::status::ChunkStatus,
         poi::PoiSquareColumns,
-        test_support::{BlockedPool, fresh_test_world, insert_ready_full_chunk},
+        test_support::{BlockedPool, fresh_test_world, insert_ready_full_chunk, one_thread_pool},
     };
 
     use crate::chunk_saver::SavedPoi;
@@ -270,12 +262,7 @@ mod tests {
         };
         let storage = Arc::clone(&world.chunk_map.storage);
         assert!(matches!(*storage, ChunkStorage::RamOnly(_)));
-        let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .expect("test pool should build"),
-        );
+        let pool = Arc::new(one_thread_pool());
         let (min_y, height) = (world.get_min_y(), world.get_height());
         // A runtime of its own: while the test awaits, only the scan task can run on it, so
         // the scan reliably reaches the pool before the checks below.
@@ -364,10 +351,7 @@ mod tests {
             .expect("vanilla lodestone POI type should be registered");
         let expected = vec![(low, lodestone), (high, lodestone)];
         let (min_y, height) = (world.get_min_y(), world.get_height());
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .expect("test pool should build");
+        let pool = one_thread_pool();
         let not_cancelled = Arc::new(AtomicBool::new(false));
         let runtime = Builder::new_current_thread()
             .enable_all()
@@ -404,50 +388,6 @@ mod tests {
             panic!("the saved chunk should be read back");
         };
         assert_eq!(read, [(chunk_pos, expected)]);
-    }
-
-    #[test]
-    fn damaged_packing_in_a_poi_section_rejects_the_chunk() {
-        steel_registry::init_vanilla_registry();
-        init_behaviors();
-        init_block_entities();
-        let world_fixture = fresh_test_world("poi-damaged-section");
-        let world = &world_fixture.world;
-        let chunk_pos = ChunkPos::new(1, 1);
-        let holder = insert_ready_full_chunk(world, chunk_pos);
-        assert!(world.set_block(
-            BlockPos::new(20, 70, 20),
-            vanilla_blocks::LODESTONE.default_state(),
-            UpdateFlags::UPDATE_ALL,
-        ));
-        let Some(chunk) = holder.try_chunk(ChunkStatus::Full) else {
-            panic!("inserted chunk should be Full");
-        };
-        let Some(mut prepared) =
-            ChunkStorage::prepare_chunk_save(chunk, ChunkStatus::Full, &[], true)
-        else {
-            panic!("a forced save should be prepared");
-        };
-        let (min_y, height) = (world.get_min_y(), world.get_height());
-        assert_eq!(
-            ChunkStorage::persistent_pois(&prepared.persistent, chunk_pos, min_y, height)
-                .map(|pois| pois.len())
-                .ok(),
-            Some(1)
-        );
-
-        // Truncate the packed blocks of the section holding the lodestone.
-        let section_index = usize::try_from((70 - min_y) / 16).expect("section index");
-        let PersistentSection::Heterogeneous { block_data, .. } =
-            &mut prepared.persistent.sections[section_index]
-        else {
-            panic!("the lodestone's section should be heterogeneous");
-        };
-        *block_data = block_data[..block_data.len() / 2].into();
-        assert!(matches!(
-            ChunkStorage::persistent_pois(&prepared.persistent, chunk_pos, min_y, height),
-            Err(error) if error.kind() == io::ErrorKind::InvalidData
-        ));
     }
 
     #[test]
@@ -499,7 +439,20 @@ mod tests {
             Some(1)
         );
 
-        // A POI section with an impossible bit width is rejected, not unpacked.
+        // A POI section with truncated packing is rejected, not unpacked...
+        let mut damaged = saved();
+        let PersistentSection::Heterogeneous { block_data, .. } =
+            &mut damaged.sections[section_of(70)]
+        else {
+            panic!("the lodestone's section should be heterogeneous");
+        };
+        *block_data = block_data[..block_data.len() / 2].into();
+        assert!(matches!(
+            scan(&damaged, min_y, height),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+
+        // ...and so is one with an impossible bit width.
         let mut damaged = saved();
         let PersistentSection::Heterogeneous { bits_per_entry, .. } =
             &mut damaged.sections[section_of(70)]

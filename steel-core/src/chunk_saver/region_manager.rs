@@ -30,8 +30,9 @@ use crate::world::World;
 use super::{
     ChunkStorage, LoadedChunk, PersistentChunk,
     format::{
-        CHUNK_TABLE_SIZE, ChunkEntry, FILE_HEADER_SIZE, FIRST_DATA_SECTOR, FORMAT_VERSION,
-        MAX_CHUNK_SIZE, REGION_MAGIC, RegionHeader, RegionPos, SECTOR_SIZE, TOTAL_HEADER_SIZE,
+        CHUNK_ENTRY_SIZE, CHUNK_TABLE_SIZE, ChunkEntry, FILE_HEADER_SIZE, FIRST_DATA_SECTOR,
+        FORMAT_VERSION, MAX_CHUNK_SIZE, REGION_MAGIC, RegionHeader, RegionPos, SECTOR_SIZE,
+        TOTAL_HEADER_SIZE,
     },
 };
 
@@ -717,10 +718,8 @@ impl RegionManager {
             if cancelled.load(Ordering::Relaxed) {
                 break;
             }
-            match self.read_saved_chunk(pos, &mut unopened).await {
-                Ok(Some(data)) => saved.push((pos, Ok(data))),
-                Ok(None) => {}
-                Err(error) => saved.push((pos, Err(error))),
+            if let Some(data) = self.read_saved_chunk(pos, &mut unopened).await.transpose() {
+                saved.push((pos, data));
             }
         }
         saved
@@ -779,8 +778,8 @@ impl RegionManager {
 
     /// Reads chunk table entry `index` and, if it exists, its payload from a region file.
     fn read_unopened_chunk(file: &mut StdFile, index: usize) -> io::Result<Option<Vec<u8>>> {
-        file.seek(io::SeekFrom::Start((FILE_HEADER_SIZE + index * 8) as u64))?;
-        let mut entry_bytes = [0u8; 8];
+        file.seek(io::SeekFrom::Start(RegionHeader::entry_offset(index)))?;
+        let mut entry_bytes = [0u8; CHUNK_ENTRY_SIZE];
         file.read_exact(&mut entry_bytes)?;
         let Some(entry) = ChunkEntry::from_bytes(entry_bytes) else {
             return Err(io::Error::new(
@@ -1309,16 +1308,12 @@ mod tests {
         // Point a second chunk at the first one's sectors, which `open_region` rejects.
         let region_file = directory.join(RegionPos::from_chunk(first.0.x, first.0.y).filename());
         let mut bytes = fs::read(&region_file).await.expect("region should exist");
-        let entry_offset = |pos: ChunkPos| {
+        let entry = |pos: ChunkPos| {
             let (local_x, local_z) = RegionPos::local_chunk_pos(pos.0.x, pos.0.y);
-            FILE_HEADER_SIZE + RegionHeader::chunk_index(local_x, local_z) * 8
+            let start = RegionHeader::entry_offset(RegionHeader::chunk_index(local_x, local_z));
+            start as usize..start as usize + CHUNK_ENTRY_SIZE
         };
-        let first_entry = entry_offset(first);
-        let entry: [u8; 8] = bytes[first_entry..first_entry + 8]
-            .try_into()
-            .expect("entry is 8 bytes");
-        let second_entry = entry_offset(second);
-        bytes[second_entry..second_entry + 8].copy_from_slice(&entry);
+        bytes.copy_within(entry(first), entry(second).start);
         fs::write(&region_file, &bytes)
             .await
             .expect("region should be rewritten");

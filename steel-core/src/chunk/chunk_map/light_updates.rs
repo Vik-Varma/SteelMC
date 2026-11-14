@@ -1,7 +1,7 @@
 use super::{
-    Arc, BlockPos, ChunkHolder, ChunkMap, ChunkPos, ChunkStatus, InFlightLightUpdates,
-    LightCacheLayout, LightCacheSetupRadius, LightLayer, LightSectionEmptinessChange,
-    LightSectionRange, LightUpdateState, LightWorkset, PendingChunkLightUpdates, SectionPos,
+    Arc, BlockPos, ChunkMap, ChunkPos, ChunkStatus, InFlightLightUpdates, LightCacheLayout,
+    LightCacheSetupRadius, LightLayer, LightSectionEmptinessChange, LightSectionRange,
+    LightUpdateState, LightWorkset, PendingChunkLightUpdates, SectionPos,
     propagate_block_light_changes_with_empty_sections,
     propagate_sky_light_changes_with_empty_sections,
 };
@@ -282,16 +282,6 @@ impl ChunkMap {
     pub(super) fn light_update_center_is_available(&self, center: ChunkPos) -> bool {
         self.current_holder(center)
             .is_some_and(|holder| holder.try_chunk(ChunkStatus::Light).is_some())
-    }
-
-    /// The holder at `chunk_pos`, active or waiting to unload.
-    pub(crate) fn current_holder(&self, chunk_pos: ChunkPos) -> Option<Arc<ChunkHolder>> {
-        self.chunks
-            .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))
-            .or_else(|| {
-                self.unloading_chunks
-                    .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))
-            })
     }
 
     pub(super) fn propagate_queued_light_change(
