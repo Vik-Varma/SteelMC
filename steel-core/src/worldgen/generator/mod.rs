@@ -74,12 +74,8 @@ pub trait ChunkGenerator: Send + Sync {
     /// Creates the structures in a chunk.
     fn create_structures(&self, chunk: &Chunk);
 
-    /// Whether `structure` could start in the placement chunk `chunk_pos` under `placement`,
-    /// decided without generating the chunk, as vanilla's `StructureCheck` does for chunks it
-    /// has no starts for. `min_y` and `height` are the world's build range.
-    ///
-    /// `true` means the chunk must be generated to know. Generators that cannot tell answer
-    /// `true`.
+    /// [`StructureGenerator::could_start_structure`] for the placement chunk `chunk_pos`, with
+    /// `min_y` and `height` the world's build range. Generators that cannot tell answer `true`.
     fn could_start_structure(
         &self,
         _chunk_pos: ChunkPos,

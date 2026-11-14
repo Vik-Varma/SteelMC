@@ -19,7 +19,7 @@ use std::{
     time::Instant,
 };
 
-use steel_utils::{BlockPos, Identifier, translations};
+use steel_utils::{BlockPos, ChunkPos, Identifier, translations};
 use text_components::TextComponent;
 use tokio::sync::oneshot;
 
@@ -40,7 +40,7 @@ use crate::{
     world::World,
     worldgen::{
         generator::ChunkGenerator,
-        structure::{StructureLocateCandidate, StructureLocatePlan, squared_distance},
+        structure::{StructureLocateCandidate, StructureLocatePlan},
     },
 };
 
@@ -85,7 +85,6 @@ pub(super) fn start_search(
         origin: BlockPos::from(context.source().position()),
         phase: LocatePhase::Start,
         stage: Stage::Rings,
-        check: None,
         scans: Vec::new(),
         best: None,
         random_radius: 0,
@@ -100,7 +99,7 @@ enum LocatePhase {
     /// Collect the next random-spread shell's candidates.
     RandomSpread,
     /// Waiting for the presence checks of the current stage's candidates.
-    Checking,
+    Checking(oneshot::Receiver<CheckedCandidates>),
     /// Generating candidate chunks, one per scan at a time.
     Resolving,
 }
@@ -133,8 +132,7 @@ struct Scan {
 
 /// Candidates with their checks, in scan order.
 struct CheckedCandidates {
-    candidates: Vec<StructureLocateCandidate>,
-    checks: Vec<CandidateCheck>,
+    candidates: Vec<(StructureLocateCandidate, CandidateCheck)>,
     /// For a random-spread check, the radius to check next.
     next_radius: Option<i32>,
 }
@@ -142,7 +140,7 @@ struct CheckedCandidates {
 struct LocatedStructure {
     candidate: StructureLocateCandidate,
     found_structure: Identifier,
-    distance_sqr: i64,
+    distance_sqr: f64,
 }
 
 pub(super) struct LocateStructureSearch {
@@ -153,7 +151,6 @@ pub(super) struct LocateStructureSearch {
     origin: BlockPos,
     phase: LocatePhase,
     stage: Stage,
-    check: Option<oneshot::Receiver<CheckedCandidates>>,
     scans: Vec<Scan>,
     best: Option<LocatedStructure>,
     random_radius: i32,
@@ -164,27 +161,24 @@ pub(super) struct LocateStructureSearch {
 impl CommandResultSuspension for LocateStructureSearch {
     fn poll(&mut self) -> CommandResultSuspensionPoll {
         loop {
-            match self.phase {
+            match &mut self.phase {
                 LocatePhase::Start => {
                     let candidates = self.plan.ring_candidates(self.origin);
                     if candidates.is_empty() {
                         self.phase = LocatePhase::RandomSpread;
                         continue;
                     }
-                    self.start_check(Stage::Rings, candidates);
+                    self.start_ring_check(candidates);
                     return CommandResultSuspensionPoll::Pending;
                 }
                 LocatePhase::RandomSpread => {
                     if self.random_radius > MAX_STRUCTURE_SEARCH_RADIUS {
-                        return self.success_result();
+                        return self.finished_result();
                     }
                     self.start_shell_check();
                     return CommandResultSuspensionPoll::Pending;
                 }
-                LocatePhase::Checking => {
-                    let Some(check) = &mut self.check else {
-                        return Self::cancelled_result();
-                    };
+                LocatePhase::Checking(check) => {
                     let checked = match check.try_recv() {
                         Ok(checked) => checked,
                         Err(oneshot::error::TryRecvError::Empty) => {
@@ -194,11 +188,10 @@ impl CommandResultSuspension for LocateStructureSearch {
                             return Self::cancelled_result();
                         }
                     };
-                    self.check = None;
                     if let Some(next_radius) = checked.next_radius {
                         self.random_radius = next_radius;
                     }
-                    self.scans = scans(checked.candidates, checked.checks);
+                    self.scans = scans(checked.candidates);
                     self.phase = LocatePhase::Resolving;
                 }
                 LocatePhase::Resolving => match self.resolve_scans() {
@@ -211,7 +204,7 @@ impl CommandResultSuspension for LocateStructureSearch {
                             Stage::RandomSpreadShell => found_any,
                         };
                         if done {
-                            return self.success_result();
+                            return self.finished_result();
                         }
                         self.phase = LocatePhase::RandomSpread;
                     }
@@ -231,13 +224,11 @@ impl CommandResultSuspension for LocateStructureSearch {
 }
 
 impl LocateStructureSearch {
-    /// Checks `candidates` on the locate search pool, off the server thread.
-    fn start_check(&mut self, stage: Stage, candidates: Vec<StructureLocateCandidate>) {
-        self.spawn_check(stage, move |world, plan, cancelled| {
-            let checks = check_candidates(world, plan, &candidates, cancelled)?;
+    /// Checks the ring `candidates` on the locate search pool, off the server thread.
+    fn start_ring_check(&mut self, candidates: Vec<StructureLocateCandidate>) {
+        self.spawn_check(Stage::Rings, move |world, plan, cancelled| {
             Some(CheckedCandidates {
-                candidates,
-                checks,
+                candidates: check_candidates(world, plan, candidates, cancelled)?,
                 next_radius: None,
             })
         });
@@ -252,18 +243,19 @@ impl LocateStructureSearch {
         self.spawn_check(Stage::RandomSpreadShell, move |world, plan, cancelled| {
             for radius in first_radius..=MAX_STRUCTURE_SEARCH_RADIUS {
                 let candidates = plan.random_spread_candidates_at_radius(origin, radius);
-                let checks = check_candidates(world, plan, &candidates, cancelled)?;
-                if checks.iter().any(|check| *check != CandidateCheck::Absent) {
+                let candidates = check_candidates(world, plan, candidates, cancelled)?;
+                if candidates
+                    .iter()
+                    .any(|(_, check)| *check != CandidateCheck::Absent)
+                {
                     return Some(CheckedCandidates {
                         candidates,
-                        checks,
                         next_radius: Some(radius + 1),
                     });
                 }
             }
             Some(CheckedCandidates {
                 candidates: Vec::new(),
-                checks: Vec::new(),
                 next_radius: Some(MAX_STRUCTURE_SEARCH_RADIUS + 1),
             })
         });
@@ -287,16 +279,15 @@ impl LocateStructureSearch {
             }
         });
         self.stage = stage;
-        self.check = Some(receiver);
-        self.phase = LocatePhase::Checking;
+        self.phase = LocatePhase::Checking(receiver);
     }
 
     /// Advances every unfinished scan until it finds a start, runs out of candidates, or
     /// waits on a chunk.
     fn resolve_scans(&mut self) -> PendingRequest {
         let mut waiting = false;
-        for index in 0..self.scans.len() {
-            match self.resolve_scan(index) {
+        for scan in &mut self.scans {
+            match scan.resolve(&self.world, self.origin) {
                 PendingRequest::Pending => waiting = true,
                 PendingRequest::Cancelled => return PendingRequest::Cancelled,
                 PendingRequest::Ready => {}
@@ -307,55 +298,6 @@ impl LocateStructureSearch {
         } else {
             PendingRequest::Ready
         }
-    }
-
-    fn resolve_scan(&mut self, index: usize) -> PendingRequest {
-        let Self {
-            scans,
-            world,
-            origin,
-            ..
-        } = self;
-        let scan = &mut scans[index];
-        while scan.found.is_none() {
-            let Some(&(candidate, ref check)) = scan.candidates.get(scan.next) else {
-                break;
-            };
-            let found_structure = match check {
-                CandidateCheck::Absent => None,
-                CandidateCheck::Present(structure) => Some(structure.clone()),
-                CandidateCheck::NeedsChunk(structures) => {
-                    let Some(pending) = &scan.pending else {
-                        scan.pending = Some(world.chunk_map.request_chunks(ChunkRequest {
-                            status: ChunkStatus::StructureStarts,
-                            positions: vec![candidate.chunk_pos],
-                            ticket_kind: ChunkTicketKind::StructureLocate,
-                        }));
-                        return PendingRequest::Pending;
-                    };
-                    match pending.poll() {
-                        ChunkRequestState::Pending { .. } => return PendingRequest::Pending,
-                        ChunkRequestState::Cancelled => return PendingRequest::Cancelled,
-                        ChunkRequestState::Ready => {}
-                    }
-                    let found = Self::generated_structure_at(world, candidate, structures);
-                    // Releases the chunk's locate ticket.
-                    scan.pending = None;
-                    found
-                }
-            };
-            match found_structure {
-                Some(found_structure) => {
-                    scan.found = Some(LocatedStructure {
-                        candidate,
-                        found_structure,
-                        distance_sqr: squared_distance(candidate.locate_pos, *origin),
-                    });
-                }
-                None => scan.next += 1,
-            }
-        }
-        PendingRequest::Ready
     }
 
     /// Moves the scans' finds into `best`, keeping the earliest scan's find on ties.
@@ -378,20 +320,7 @@ impl LocateStructureSearch {
         found_any
     }
 
-    fn generated_structure_at(
-        world: &World,
-        candidate: StructureLocateCandidate,
-        structures: &[Identifier],
-    ) -> Option<Identifier> {
-        let holder = world
-            .chunk_map
-            .chunks
-            .read_sync(&candidate.chunk_pos, |_, holder| Arc::clone(holder))?;
-        let chunk = holder.try_chunk(ChunkStatus::StructureStarts)?;
-        first_started_structure(chunk, structures)
-    }
-
-    fn success_result(&self) -> CommandResultSuspensionPoll {
+    fn finished_result(&self) -> CommandResultSuspensionPoll {
         let Some(best) = &self.best else {
             return CommandResultSuspensionPoll::Ready(Err(structure_not_found(&self.query)));
         };
@@ -420,30 +349,79 @@ impl Drop for LocateStructureSearch {
     }
 }
 
+impl Scan {
+    /// Resolves candidates until one holds a start, none are left, or a chunk is awaited.
+    fn resolve(&mut self, world: &World, origin: BlockPos) -> PendingRequest {
+        while self.found.is_none() {
+            let Some(&(candidate, ref check)) = self.candidates.get(self.next) else {
+                break;
+            };
+            let found_structure = match check {
+                CandidateCheck::Absent => None,
+                CandidateCheck::Present(structure) => Some(structure.clone()),
+                CandidateCheck::NeedsChunk(structures) => {
+                    let Some(pending) = &self.pending else {
+                        self.pending = Some(world.chunk_map.request_chunks(ChunkRequest {
+                            status: ChunkStatus::StructureStarts,
+                            positions: vec![candidate.chunk_pos],
+                            ticket_kind: ChunkTicketKind::StructureLocate,
+                        }));
+                        return PendingRequest::Pending;
+                    };
+                    match pending.poll() {
+                        ChunkRequestState::Pending { .. } => return PendingRequest::Pending,
+                        ChunkRequestState::Cancelled => return PendingRequest::Cancelled,
+                        ChunkRequestState::Ready => {}
+                    }
+                    let check = check_in_memory(world, candidate.chunk_pos, structures);
+                    // Releases the chunk's locate ticket.
+                    self.pending = None;
+                    match check {
+                        Some(CandidateCheck::Present(structure)) => Some(structure),
+                        _ => None,
+                    }
+                }
+            };
+            match found_structure {
+                Some(found_structure) => {
+                    self.found = Some(LocatedStructure {
+                        candidate,
+                        found_structure,
+                        distance_sqr: candidate.locate_pos.dist_sqr(origin),
+                    });
+                }
+                None => self.next += 1,
+            }
+        }
+        PendingRequest::Ready
+    }
+}
+
 /// Groups checked candidates into scans, keeping each scan's candidates in order.
-fn scans(candidates: Vec<StructureLocateCandidate>, checks: Vec<CandidateCheck>) -> Vec<Scan> {
+fn scans(candidates: Vec<(StructureLocateCandidate, CandidateCheck)>) -> Vec<Scan> {
     let mut scans = BTreeMap::<usize, Scan>::new();
-    for (candidate, check) in candidates.into_iter().zip(checks) {
+    for checked in candidates {
         scans
-            .entry(candidate.scan_id())
+            .entry(checked.0.scan_id())
             .or_default()
             .candidates
-            .push((candidate, check));
+            .push(checked);
     }
     scans.into_values().collect()
 }
 
-/// [`check_candidate`] for each of `candidates`, or `None` once `cancelled` is set.
+/// Pairs each of `candidates` with its [`check_candidate`], or `None` once `cancelled` is set.
 fn check_candidates(
     world: &World,
     plan: &StructureLocatePlan,
-    candidates: &[StructureLocateCandidate],
+    candidates: Vec<StructureLocateCandidate>,
     cancelled: &AtomicBool,
-) -> Option<Vec<CandidateCheck>> {
+) -> Option<Vec<(StructureLocateCandidate, CandidateCheck)>> {
     candidates
-        .iter()
-        .map(|&candidate| {
-            (!cancelled.load(Ordering::Relaxed)).then(|| check_candidate(world, plan, candidate))
+        .into_iter()
+        .map(|candidate| {
+            (!cancelled.load(Ordering::Relaxed))
+                .then(|| (candidate, check_candidate(world, plan, candidate)))
         })
         .collect()
 }
@@ -458,16 +436,8 @@ fn check_candidate(
     let Some(structures) = plan.structures_for_candidate(candidate) else {
         return CandidateCheck::Absent;
     };
-    let holder = world
-        .chunk_map
-        .chunks
-        .read_sync(&candidate.chunk_pos, |_, holder| Arc::clone(holder));
-    if let Some(chunk) = holder
-        .as_deref()
-        .and_then(|holder| holder.try_chunk(ChunkStatus::StructureStarts))
-    {
-        return first_started_structure(chunk, structures)
-            .map_or(CandidateCheck::Absent, CandidateCheck::Present);
+    if let Some(check) = check_in_memory(world, candidate.chunk_pos, structures) {
+        return check;
     }
 
     let Some(placement) = plan.placement_for_candidate(candidate) else {
@@ -492,6 +462,24 @@ fn check_candidate(
     } else {
         CandidateCheck::NeedsChunk(possible)
     }
+}
+
+/// Whether one of `structures` starts in the chunk at `chunk_pos`, or `None` if the chunk's
+/// starts are not in memory.
+fn check_in_memory(
+    world: &World,
+    chunk_pos: ChunkPos,
+    structures: &[Identifier],
+) -> Option<CandidateCheck> {
+    let holder = world
+        .chunk_map
+        .chunks
+        .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))?;
+    let chunk = holder.try_chunk(ChunkStatus::StructureStarts)?;
+    Some(
+        first_started_structure(chunk, structures)
+            .map_or(CandidateCheck::Absent, CandidateCheck::Present),
+    )
 }
 
 /// The first of `structures` with a valid start in `chunk`.
