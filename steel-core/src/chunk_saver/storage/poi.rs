@@ -252,7 +252,7 @@ mod tests {
         block_entity::init_block_entities,
         chunk::status::ChunkStatus,
         poi::PoiSquareColumns,
-        test_support::{block_pool, fresh_test_world, insert_ready_full_chunk},
+        test_support::{BlockedPool, fresh_test_world, insert_ready_full_chunk},
     };
 
     #[test]
@@ -303,7 +303,7 @@ mod tests {
                 Ok(true)
             ));
 
-            let blocked = block_pool(&pool);
+            let blocked = BlockedPool::new(&pool);
             let scan = tokio::spawn({
                 let storage = Arc::clone(&storage);
                 let pool = Arc::clone(&pool);
@@ -339,7 +339,7 @@ mod tests {
             assert_eq!(found, [(chunk_pos, vec![(lodestone_pos, lodestone)])]);
 
             // A cancelled scan stops before scanning anything.
-            let _busy = block_pool(&pool);
+            let _busy = BlockedPool::new(&pool);
             let cancelled = Arc::new(AtomicBool::new(true));
             let positions = [chunk_pos];
             let scan = storage.saved_chunk_pois(&positions, min_y, height, &pool, &cancelled);

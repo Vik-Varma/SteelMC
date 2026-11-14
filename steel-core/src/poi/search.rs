@@ -198,7 +198,7 @@ mod tests {
     };
 
     use super::{PoiSquareColumns, find_closest_with_type};
-    use crate::test_support::{block_pool, fresh_test_world, insert_ready_full_chunk};
+    use crate::test_support::{BlockedPool, fresh_test_world, insert_ready_full_chunk};
     use steel_utils::{BlockPos, ChunkPos};
 
     const HOME: usize = 1;
@@ -260,7 +260,7 @@ mod tests {
         );
         let cancelled = Arc::new(AtomicBool::new(false));
 
-        let blocked = block_pool(&pool);
+        let blocked = BlockedPool::new(&pool);
         let search = world.chunk_map.chunk_runtime.spawn({
             let storage = Arc::clone(&world.chunk_map.storage);
             let pool = Arc::clone(&pool);

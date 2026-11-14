@@ -89,10 +89,7 @@ fn horizontal_distance(a: BlockPos, b: BlockPos) -> i32 {
 
 /// `Mth.floor(Mth.sqrt((float) a.distSqr(b)))`, where `distSqr` works in doubles.
 fn distance_3d(a: BlockPos, b: BlockPos) -> i32 {
-    let dx = f64::from(a.0.x) - f64::from(b.0.x);
-    let dy = f64::from(a.0.y) - f64::from(b.0.y);
-    let dz = f64::from(a.0.z) - f64::from(b.0.z);
-    let squared = (dx * dx + dy * dy + dz * dz) as f32;
+    let squared = a.dist_sqr(b) as f32;
     (f64::from(squared).sqrt() as f32).floor() as i32
 }
 
