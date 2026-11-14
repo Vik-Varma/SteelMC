@@ -4,6 +4,7 @@ use crate::chunk::chunk_pyramid::GENERATION_PYRAMID;
 use crate::chunk::chunk_request::{ChunkRequest, ChunkTicketKind};
 use crate::chunk_saver::SavedPoi;
 use crate::poi::PoiSquareColumns;
+use crate::test_support::one_thread_pool;
 use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -356,10 +357,7 @@ fn unload_until_finalized(world: &Arc<World>, chunk_pos: ChunkPos, holder: Arc<C
 }
 
 fn scan(world: &World, columns: PoiSquareColumns) -> Vec<SavedPoi> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .expect("test pool should build");
+    let pool = one_thread_pool();
     world
         .chunk_map
         .chunk_runtime

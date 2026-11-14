@@ -1,5 +1,18 @@
 use super::*;
 
+/// The completion suggestions for `input`.
+fn suggested(dispatcher: &TestDispatcher, input: &str) -> Vec<String> {
+    let parse = dispatcher.parse(input, TestSource::new());
+    let Ok(suggestions) = dispatcher.completion_suggestions(&parse) else {
+        panic!("suggestions for {input:?} should build");
+    };
+    suggestions
+        .list()
+        .iter()
+        .map(|suggestion| suggestion.text().to_owned())
+        .collect()
+}
+
 #[test]
 fn biome_or_tag_argument_resolves_registry_entries_and_tags() {
     init_vanilla_registry();
@@ -44,17 +57,7 @@ fn biome_or_tag_argument_resolves_registry_entries_and_tags() {
     );
 
     // Like vanilla, tags are only offered for empty input or after `#`.
-    let suggested = |input: &str| {
-        let parse = dispatcher.parse(input, TestSource::new());
-        let Ok(suggestions) = dispatcher.completion_suggestions(&parse) else {
-            panic!("biome suggestions should build");
-        };
-        suggestions
-            .list()
-            .iter()
-            .map(|suggestion| suggestion.text().to_owned())
-            .collect::<Vec<_>>()
-    };
+    let suggested = |input| suggested(&dispatcher, input);
     let plain = suggested("resource is_");
     assert!(plain.iter().all(|text| !text.starts_with('#')), "{plain:?}");
     let empty = suggested("resource ");
@@ -103,35 +106,11 @@ fn poi_type_or_tag_argument_resolves_registry_entries_and_tags() {
         );
     }
 
-    let parse = dispatcher.parse("resource #bee", TestSource::new());
-    let Ok(suggestions) = dispatcher.completion_suggestions(&parse) else {
-        panic!("POI type tag suggestions should build");
-    };
-    assert!(
-        suggestions
-            .list()
-            .iter()
-            .any(|suggestion| suggestion.text() == "#minecraft:bee_home")
-    );
-
-    // Like vanilla, tags are only offered for empty input or after `#`.
-    let suggested = |input: &str| {
-        let parse = dispatcher.parse(input, TestSource::new());
-        let Ok(suggestions) = dispatcher.completion_suggestions(&parse) else {
-            panic!("POI type suggestions should build");
-        };
-        suggestions
-            .list()
-            .iter()
-            .map(|suggestion| suggestion.text().to_owned())
-            .collect::<Vec<_>>()
-    };
-    let plain = suggested("resource bee");
-    assert!(plain.iter().any(|text| text == "minecraft:bee_nest"));
-    assert!(plain.iter().all(|text| !text.starts_with('#')), "{plain:?}");
-    let empty = suggested("resource ");
-    assert!(empty.iter().any(|text| text == "#minecraft:bee_home"));
-    assert!(empty.iter().any(|text| text == "minecraft:bee_nest"));
+    // The suggestion rules are shared with the biome argument; this checks the POI registry
+    // is the one suggested from.
+    let suggested = |input| suggested(&dispatcher, input);
+    assert!(suggested("resource #bee").contains(&"#minecraft:bee_home".to_owned()));
+    assert!(suggested("resource bee").contains(&"minecraft:bee_nest".to_owned()));
 }
 
 #[test]

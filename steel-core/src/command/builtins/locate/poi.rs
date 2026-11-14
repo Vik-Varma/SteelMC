@@ -30,6 +30,7 @@ use crate::{
     poi::{PoiSquareColumns, find_closest_with_type},
 };
 
+// From vanilla's `LocateCommand`.
 const POI_SEARCH_RADIUS: i32 = 256;
 
 /// Starts the search on the chunk runtime and the server's locate search pool.

@@ -95,10 +95,8 @@ impl PoiSquareColumns {
                     .as_deref()
                     .and_then(|chunk_map| chunk_map.current_holder(chunk_pos))
                     .or_else(|| holder.and_then(|holder| holder.upgrade()));
-                let in_memory = holder.and_then(|holder| {
-                    let chunk = holder.try_chunk(ChunkStatus::Empty)?;
-                    Some(in_memory_pois(chunk, chunk_pos))
-                });
+                let in_memory = holder
+                    .and_then(|holder| holder.try_chunk(ChunkStatus::Empty).map(in_memory_pois));
                 scanned.push((chunk_pos, in_memory));
             }
             let _ = sender.send(Ok(scanned));
@@ -130,7 +128,8 @@ impl PoiSquareColumns {
     }
 }
 
-fn in_memory_pois(chunk: &Chunk, chunk_pos: ChunkPos) -> Vec<SavedPoi> {
+fn in_memory_pois(chunk: &Chunk) -> Vec<SavedPoi> {
+    let chunk_pos = chunk.pos();
     let min_section_y = SectionPos::block_to_section_coord(chunk.min_y());
     let mut found = Vec::new();
     for (index, section) in chunk.sections().sections.iter().enumerate() {
@@ -145,7 +144,8 @@ fn in_memory_pois(chunk: &Chunk, chunk_pos: ChunkPos) -> Vec<SavedPoi> {
 }
 
 /// `PoiManager.findClosestWithType` with `Occupancy.ANY`: the closest POI whose type
-/// `matches`, within `radius` horizontally and as a sphere measured to block corners.
+/// `matches`, within a sphere of `radius` measured to block corners. Vanilla's horizontal
+/// square filter is implied by the sphere.
 ///
 /// Vanilla breaks ties by its stream order, part of which is Java hash-map order that is not
 /// reproducible; equally distant POIs resolve to the first in `pois` order instead.
@@ -157,11 +157,7 @@ pub fn find_closest_with_type(
 ) -> Option<SavedPoi> {
     let radius_sqr = f64::from(radius * radius);
     pois.into_iter()
-        .filter(|&(pos, poi_type)| {
-            matches(poi_type)
-                && (pos.x() - center.x()).abs() <= radius
-                && (pos.z() - center.z()).abs() <= radius
-        })
+        .filter(|&(_, poi_type)| matches(poi_type))
         .map(|poi| (poi.0.dist_sqr(center), poi))
         .filter(|&(distance_sqr, _)| distance_sqr <= radius_sqr)
         // `min_by` keeps the first of equal minima.
@@ -180,7 +176,9 @@ mod tests {
     };
 
     use super::{PoiSquareColumns, find_closest_with_type};
-    use crate::test_support::{BlockedPool, fresh_test_world, insert_ready_full_chunk};
+    use crate::test_support::{
+        BlockedPool, fresh_test_world, insert_ready_full_chunk, one_thread_pool,
+    };
     use steel_utils::{BlockPos, ChunkPos};
 
     const HOME: usize = 1;
@@ -234,12 +232,7 @@ mod tests {
         let world = &world_fixture.world;
         insert_ready_full_chunk(world, ChunkPos::new(0, 0));
         let columns = PoiSquareColumns::capture(&world.chunk_map, BlockPos::new(0, 64, 0), 16);
-        let pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .expect("test pool should build"),
-        );
+        let pool = Arc::new(one_thread_pool());
         let cancelled = Arc::new(AtomicBool::new(false));
 
         let blocked = BlockedPool::new(&pool);

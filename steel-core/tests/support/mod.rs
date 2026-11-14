@@ -676,6 +676,15 @@ pub(crate) fn fresh_test_derived_world(primary: &Arc<World>, name: &'static str)
     )
 }
 
+/// A private one-thread Rayon pool, for tests that must not share or block the test worlds'
+/// generation pool.
+pub(crate) fn one_thread_pool() -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("test pool should build")
+}
+
 /// Keeps every thread of a Rayon pool busy until dropped, so tests can prove work waits on
 /// (or avoids) that pool.
 pub(crate) struct BlockedPool {
