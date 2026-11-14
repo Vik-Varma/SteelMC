@@ -272,8 +272,7 @@ impl StructurePlacement {
             && self.applies_additional_chunk_restrictions(seed, source_x, source_z)
     }
 
-    /// Vanilla's `applyAdditionalChunkRestrictions`: the frequency check for a placement
-    /// chunk.
+    /// The frequency check for a placement chunk.
     #[must_use]
     pub fn applies_additional_chunk_restrictions(
         &self,

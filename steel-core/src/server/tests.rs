@@ -1,5 +1,5 @@
 use crate::chunk::status::ChunkStatus;
-use crate::worldgen::structure::{StructureLocateCandidate, StructureLocatePlan};
+use crate::worldgen::structure::StructureLocatePlan;
 use glam::DVec3;
 use simdnbt::owned::{NbtCompound, NbtTag};
 use std::ptr;
@@ -34,6 +34,7 @@ use steel_registry::{
 };
 use steel_utils::{BlockPos, ChunkPos, Identifier, UuidExt as _, translations, types::UpdateFlags};
 use steel_utils::{codec::VarInt, serial::ReadFrom, text::DisplayResolutor};
+use steel_worldgen::structure::placement::StructurePlacement;
 use text_components::TextComponent;
 use tokio::{
     fs,
@@ -4848,44 +4849,6 @@ mod damage_history;
 mod game_time;
 mod projectile_owners;
 
-/// [`run_command_within`] that ticks `world` between polls, so the command's chunk requests
-/// make progress.
-fn run_command_ticking(
-    server: &Arc<Server>,
-    world: &Arc<World>,
-    command: &str,
-    limit: Duration,
-) -> Vec<(bool, i32)> {
-    let results = Arc::new(SyncMutex::new(Vec::new()));
-    let recorded = Arc::clone(&results);
-    let callback = CommandResultCallback::new(move |success, value| {
-        recorded.lock().push((success, value));
-    });
-    let source =
-        CommandSource::new(CommandSender::Console, Arc::clone(server)).with_callback(callback);
-    let chain = {
-        let dispatcher = server.command_dispatcher.read();
-        let parse = dispatcher.parse(command, source.clone());
-        dispatcher.context_chain(parse)
-    };
-    let Ok(chain) = chain else {
-        panic!("{command} should parse");
-    };
-    let mut execution = CommandExecutionContext::for_source(&source);
-    execution.queue_initial_command(chain, source, CommandResultCallback::empty());
-
-    let mut stop = execution.run();
-    let started = Instant::now();
-    while stop == ExecutionStop::Suspended {
-        assert!(started.elapsed() < limit, "{command} should finish");
-        world.tick_game(1, false);
-        thread::sleep(Duration::from_millis(1));
-        stop = execution.poll_suspension();
-    }
-    assert_eq!(stop, ExecutionStop::Completed);
-    results.lock().clone()
-}
-
 /// Positions of every chunk in `world` with its structure starts generated.
 fn chunks_with_structure_starts(world: &World) -> Vec<ChunkPos> {
     let mut positions = Vec::new();
@@ -4901,26 +4864,20 @@ fn chunks_with_structure_starts(world: &World) -> Vec<ChunkPos> {
 #[test]
 fn locate_structure_skips_structures_whose_biomes_cannot_occur() {
     // Structure generators overflow the default test stack in debug builds.
-    thread::Builder::new()
-        .stack_size(DEBUG_STACK_SIZE)
-        .spawn(locate_structure_biome_filter_test)
-        .expect("test thread should spawn")
-        .join()
-        .expect("test thread panicked");
+    with_server_runtime(locate_structure_biome_filter_test);
 }
 
-fn locate_structure_biome_filter_test() {
+fn locate_structure_biome_filter_test(runtime: &Arc<Runtime>) {
     use crate::test_support::fresh_flat_world_with_structure_sets;
 
     init_vanilla_registry();
     init_behaviors();
-    let world_fixture =
-        fresh_flat_world_with_structure_sets("locate-structure-biomes", 7, &["villages"]);
+    let world_fixture = fresh_flat_world_with_structure_sets(
+        "locate-structure-biomes",
+        OUTPOST_WORLD_SEED,
+        &["villages"],
+    );
     let world = &world_fixture.world;
-    let runtime = Builder::new_current_thread().enable_all().build();
-    let Ok(runtime) = runtime else {
-        panic!("test runtime should initialize");
-    };
     runtime.block_on(async {
         let server = test_server(Arc::clone(world), PermissionSubjectIndex::new()).await;
         let Ok(server) = server else {
@@ -4935,6 +4892,7 @@ fn locate_structure_biome_filter_test() {
                 &server,
                 "locate structure minecraft:village_desert",
                 Duration::ZERO,
+                || {},
             ),
             [(false, 0)]
         );
@@ -4945,15 +4903,10 @@ fn locate_structure_biome_filter_test() {
 #[test]
 fn locate_structure_generates_only_chunks_a_requested_structure_could_start_in() {
     // Structure generators overflow the default test stack in debug builds.
-    thread::Builder::new()
-        .stack_size(DEBUG_STACK_SIZE)
-        .spawn(locate_structure_presence_check_test)
-        .expect("test thread should spawn")
-        .join()
-        .expect("test thread panicked");
+    with_server_runtime(locate_structure_presence_check_test);
 }
 
-fn locate_structure_presence_check_test() {
+fn locate_structure_presence_check_test(runtime: &Arc<Runtime>) {
     use crate::test_support::fresh_flat_world_with_structure_sets;
 
     init_vanilla_registry();
@@ -4961,24 +4914,19 @@ fn locate_structure_presence_check_test() {
     // Without villages to exclude them, outposts start wherever they could.
     let world_fixture = fresh_flat_world_with_structure_sets(
         "locate-structure-presence",
-        7,
+        OUTPOST_WORLD_SEED,
         &["pillager_outposts"],
     );
     let world = &world_fixture.world;
     let origin = origin_with_a_second_outpost_in_the_first_shell(world);
-    let runtime = Builder::new_current_thread().enable_all().build();
-    let Ok(runtime) = runtime else {
-        panic!("test runtime should initialize");
-    };
     runtime.block_on(async {
         let server = test_server(Arc::clone(world), PermissionSubjectIndex::new()).await;
         let Ok(server) = server else {
             panic!("test server should initialize");
         };
 
-        let results = run_command_ticking(
+        let results = run_command_within(
             &server,
-            world,
             &format!(
                 "execute positioned {} {} {} run locate structure minecraft:pillager_outpost",
                 origin.x(),
@@ -4986,6 +4934,9 @@ fn locate_structure_presence_check_test() {
                 origin.z()
             ),
             Duration::from_secs(120),
+            || {
+                world.tick_game(1, false);
+            },
         );
 
         let [(true, distance)] = results.as_slice() else {
@@ -4996,12 +4947,18 @@ fn locate_structure_presence_check_test() {
     });
 }
 
-/// The outpost locate plan of `world` and whether an outpost could start at a candidate.
+const OUTPOST_WORLD_SEED: i64 = 7;
+/// `/locate structure`'s search radius, in placement spacings.
+const STRUCTURE_SEARCH_RADIUS: i32 = 100;
+
+/// The outpost locate plan of `world`, its one placement, and whether an outpost could start
+/// in a chunk.
 fn outpost_plan(
     world: &World,
 ) -> (
     StructureLocatePlan,
-    impl Fn(&StructureLocatePlan, StructureLocateCandidate) -> bool,
+    StructurePlacement,
+    impl Fn(ChunkPos) -> bool,
 ) {
     use crate::worldgen::generator::ChunkGenerator as _;
 
@@ -5014,28 +4971,33 @@ fn outpost_plan(
     else {
         panic!("pillager outposts can occur");
     };
+    let Some(placement) =
+        plan.placement_for_candidate(plan.random_spread_candidates_at_radius(BlockPos::ZERO, 0)[0])
+    else {
+        panic!("the plan has a placement");
+    };
+    let placement = placement.clone();
     let generator = Arc::clone(&world_gen.generator);
     let (min_y, height) = (world_gen.min_y(), world_gen.height());
-    let could_start = move |plan: &StructureLocatePlan, candidate: StructureLocateCandidate| {
-        let Some(placement) = plan.placement_for_candidate(candidate) else {
-            panic!("candidates belong to the plan");
-        };
-        generator.could_start_structure(candidate.chunk_pos, min_y, height, placement, &outpost)
+    let checked_placement = placement.clone();
+    let could_start = move |chunk_pos| {
+        generator.could_start_structure(chunk_pos, min_y, height, &checked_placement, &outpost)
     };
-    (plan, could_start)
+    (plan, placement, could_start)
 }
 
 /// An origin whose first shell with an outpost has another after it, so a search that
 /// kept going past its first find would generate it.
 fn origin_with_a_second_outpost_in_the_first_shell(world: &World) -> BlockPos {
-    let (plan, could_start) = outpost_plan(world);
+    let (plan, _, could_start) = outpost_plan(world);
+    // Origins ten chunks apart.
     for step in 0..64 {
         let origin = BlockPos::new(step * 160, 64, 0);
-        for radius in 0..=100 {
+        for radius in 0..=STRUCTURE_SEARCH_RADIUS {
             let starts = plan
                 .random_spread_candidates_at_radius(origin, radius)
                 .into_iter()
-                .filter(|&candidate| could_start(&plan, candidate))
+                .filter(|candidate| could_start(candidate.chunk_pos))
                 .count();
             if starts >= 2 {
                 return origin;
@@ -5051,28 +5013,13 @@ fn origin_with_a_second_outpost_in_the_first_shell(world: &World) -> BlockPos {
 /// Checks a finished `/locate structure minecraft:pillager_outpost` search from `origin` in
 /// `world` generated no chunk no outpost could start in, and stopped at its first find.
 async fn check_outpost_search(world: &Arc<World>, origin: BlockPos, reported_distance: i32) {
-    use crate::worldgen::generator::ChunkGenerator as _;
-
-    let world_gen = &world.chunk_map.world_gen_context;
     let outpost = Identifier::vanilla_static("pillager_outpost");
-    let (plan, could_start_in) = outpost_plan(world);
-    let could_start = |candidate| could_start_in(&plan, candidate);
+    let (plan, _, could_start) = outpost_plan(world);
 
     let generated = chunks_with_structure_starts(world);
     assert_ne!(generated.len(), 0);
     // A chunk the search released may be waiting to unload, or already saved and dropped.
-    let holder = |pos: ChunkPos| {
-        world
-            .chunk_map
-            .chunks
-            .read_sync(&pos, |_, holder| Arc::clone(holder))
-            .or_else(|| {
-                world
-                    .chunk_map
-                    .unloading_chunks
-                    .read_sync(&pos, |_, holder| Arc::clone(holder))
-            })
-    };
+    let holder = |pos: ChunkPos| world.chunk_map.current_holder(pos);
     let was_generated = async |pos: ChunkPos| {
         holder(pos).is_some_and(|holder| holder.try_chunk(ChunkStatus::StructureStarts).is_some())
             || matches!(world.chunk_map.storage.chunk_exists(pos).await, Ok(true))
@@ -5095,9 +5042,9 @@ async fn check_outpost_search(world: &Arc<World>, origin: BlockPos, reported_dis
     // would also generate those no outpost could start in.
     let mut skipped = 0;
     let mut found = None;
-    'shells: for radius in 0..=100 {
+    'shells: for radius in 0..=STRUCTURE_SEARCH_RADIUS {
         for candidate in plan.random_spread_candidates_at_radius(origin, radius) {
-            if !could_start(candidate) {
+            if !could_start(candidate.chunk_pos) {
                 skipped += 1;
                 assert!(
                     !was_generated(candidate.chunk_pos).await,
@@ -5140,20 +5087,9 @@ async fn check_outpost_search(world: &Arc<World>, origin: BlockPos, reported_dis
         skipped > 0,
         "the search should have passed candidates no outpost could start in"
     );
-    let Some(placement) =
-        plan.placement_for_candidate(plan.random_spread_candidates_at_radius(origin, 0)[0])
-    else {
-        panic!("the plan has a placement");
-    };
     for pos in generated {
         assert!(
-            world_gen.generator.could_start_structure(
-                pos,
-                world_gen.min_y(),
-                world_gen.height(),
-                placement,
-                &outpost,
-            ),
+            could_start(pos),
             "{pos:?} was generated although no outpost could start there"
         );
     }
@@ -5162,20 +5098,14 @@ async fn check_outpost_search(world: &Arc<World>, origin: BlockPos, reported_dis
 /// Outposts generate in a fifth of their placement chunks. On flat plains the outpost
 /// itself fits anywhere, so the frequency is what rules most chunks out.
 fn check_outpost_frequency(world: &World, origin: BlockPos) {
-    let (plan, could_start_in) = outpost_plan(world);
-    let could_start = |candidate| could_start_in(&plan, candidate);
-    let Some(placement) =
-        plan.placement_for_candidate(plan.random_spread_candidates_at_radius(origin, 0)[0])
-    else {
-        panic!("the plan has a placement");
-    };
-    let seed = 7;
+    let (plan, placement, could_start) = outpost_plan(world);
+    let seed = OUTPOST_WORLD_SEED;
     let mut below_frequency = 0;
     for candidate in plan.random_spread_candidates_at_radius(origin, 3) {
         let (x, z) = (candidate.chunk_pos.0.x, candidate.chunk_pos.0.y);
         if !placement.applies_additional_chunk_restrictions(seed, x, z) {
             below_frequency += 1;
-            assert!(!could_start(candidate));
+            assert!(!could_start(candidate.chunk_pos));
         }
     }
     assert!(below_frequency > 0);

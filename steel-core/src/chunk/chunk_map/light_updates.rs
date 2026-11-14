@@ -280,11 +280,12 @@ impl ChunkMap {
     }
 
     pub(super) fn light_update_center_is_available(&self, center: ChunkPos) -> bool {
-        self.light_update_holder(center)
+        self.current_holder(center)
             .is_some_and(|holder| holder.try_chunk(ChunkStatus::Light).is_some())
     }
 
-    pub(super) fn light_update_holder(&self, chunk_pos: ChunkPos) -> Option<Arc<ChunkHolder>> {
+    /// The holder at `chunk_pos`, active or waiting to unload.
+    pub(crate) fn current_holder(&self, chunk_pos: ChunkPos) -> Option<Arc<ChunkHolder>> {
         self.chunks
             .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))
             .or_else(|| {
@@ -352,7 +353,7 @@ impl ChunkMap {
             LightCacheSetupRadius::Full,
             true,
             |chunk_pos| {
-                let holder = self.light_update_holder(chunk_pos)?;
+                let holder = self.current_holder(chunk_pos)?;
                 holder.try_chunk(ChunkStatus::Light)?;
                 Some(holder)
             },
