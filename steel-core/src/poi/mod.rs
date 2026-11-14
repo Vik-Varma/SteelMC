@@ -11,8 +11,6 @@ pub use poi_instance::PointOfInterest;
 pub use poi_set::PointOfInterestSet;
 pub use poi_storage::{OccupationStatus, PointOfInterestStorage};
 
-use std::sync::Arc;
-
 use steel_utils::{BlockPos, ChunkPos};
 
 use crate::{chunk::status::ChunkStatus, world::World};
@@ -45,16 +43,7 @@ impl World {
     /// chunk waits to unload, so its holder may be active or unloading; a dirty unloading
     /// chunk is saved again before it is dropped.
     fn mark_poi_chunk_dirty(&self, pos: BlockPos) {
-        let chunk_pos = ChunkPos::from_block_pos(pos);
-        let chunk_map = &self.chunk_map;
-        let holder = chunk_map
-            .chunks
-            .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))
-            .or_else(|| {
-                chunk_map
-                    .unloading_chunks
-                    .read_sync(&chunk_pos, |_, holder| Arc::clone(holder))
-            });
+        let holder = self.chunk_map.current_holder(ChunkPos::from_block_pos(pos));
         if let Some(chunk) = holder
             .as_deref()
             .and_then(|holder| holder.try_chunk(ChunkStatus::Full))
