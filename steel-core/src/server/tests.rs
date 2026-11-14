@@ -3077,6 +3077,18 @@ fn decode_system_chat(packet: &EncodedPacket) -> TextComponent {
 
 /// Parses `command` for `source` and runs it to completion on `server`.
 fn run_command(server: &Server, source: CommandSource, command: &str) {
+    assert!(matches!(
+        queue_command(server, source, command).run(),
+        ExecutionStop::Completed
+    ));
+}
+
+/// Parses `command` from `source` and queues it for execution.
+fn queue_command(
+    server: &Server,
+    source: CommandSource,
+    command: &str,
+) -> CommandExecutionContext<CommandSource> {
     let chain = {
         let dispatcher = server.command_dispatcher.read();
         let parse = dispatcher.parse(command, source.clone());
@@ -3088,17 +3100,23 @@ fn run_command(server: &Server, source: CommandSource, command: &str) {
     };
     let mut execution = CommandExecutionContext::for_source(&source);
     execution.queue_initial_command(chain, source, CommandResultCallback::empty());
-    assert!(matches!(execution.run(), ExecutionStop::Completed));
+    execution
 }
 
 /// Runs `command` as the console, polling suspensions until it finishes, and returns the
 /// reported results.
 fn run_command_to_completion(server: &Arc<Server>, command: &str) -> Vec<(bool, i32)> {
-    run_command_within(server, command, Duration::from_secs(30))
+    run_command_within(server, command, Duration::from_secs(30), || {})
 }
 
-/// [`run_command_to_completion`] that fails once `limit` passes.
-fn run_command_within(server: &Arc<Server>, command: &str, limit: Duration) -> Vec<(bool, i32)> {
+/// [`run_command_to_completion`] that fails once `limit` passes, calling `between_polls`
+/// each time the command is still waiting.
+fn run_command_within(
+    server: &Arc<Server>,
+    command: &str,
+    limit: Duration,
+    mut between_polls: impl FnMut(),
+) -> Vec<(bool, i32)> {
     let results = Arc::new(SyncMutex::new(Vec::new()));
     let recorded = Arc::clone(&results);
     let callback = CommandResultCallback::new(move |success, value| {
@@ -3106,21 +3124,13 @@ fn run_command_within(server: &Arc<Server>, command: &str, limit: Duration) -> V
     });
     let source =
         CommandSource::new(CommandSender::Console, Arc::clone(server)).with_callback(callback);
-    let chain = {
-        let dispatcher = server.command_dispatcher.read();
-        let parse = dispatcher.parse(command, source.clone());
-        dispatcher.context_chain(parse)
-    };
-    let Ok(chain) = chain else {
-        panic!("{command} should parse");
-    };
-    let mut execution = CommandExecutionContext::for_source(&source);
-    execution.queue_initial_command(chain, source, CommandResultCallback::empty());
+    let mut execution = queue_command(server, source, command);
 
     let mut stop = execution.run();
     let started = Instant::now();
     while stop == ExecutionStop::Suspended {
         assert!(started.elapsed() < limit, "{command} should finish");
+        between_polls();
         thread::sleep(Duration::from_millis(1));
         stop = execution.poll_suspension();
     }
@@ -4572,7 +4582,7 @@ fn locate_biome_command_finishes_in_the_background_with_vanilla_distances() {
 
 #[test]
 fn locate_searches_finish_while_every_generation_thread_is_busy() {
-    use crate::test_support::block_pool;
+    use crate::test_support::BlockedPool;
 
     init_vanilla_registry();
     init_behaviors();
@@ -4590,13 +4600,14 @@ fn locate_searches_finish_while_every_generation_thread_is_busy() {
 
         // Searches must not need a chunk generation thread. Test worlds share this pool, so
         // keep it blocked only briefly even if that regresses.
-        let _busy = block_pool(&world.chunk_map.generation_pool);
+        let _busy = BlockedPool::new(&world.chunk_map.generation_pool);
         let limit = Duration::from_secs(5);
         assert_eq!(
             run_command_within(
                 &server,
                 "execute positioned 0 64 0 run locate biome minecraft:plains",
                 limit,
+                || {}
             ),
             [(true, 0)]
         );

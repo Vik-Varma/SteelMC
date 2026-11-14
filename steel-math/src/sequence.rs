@@ -1,14 +1,6 @@
 //! Integer sequences shared by vanilla search loops.
 
-/// Iterator returned by [`out_from_origin`].
-#[derive(Debug, Clone)]
-pub struct OutFromOrigin {
-    origin: i32,
-    lower_bound: i32,
-    upper_bound: i32,
-    step_size: i32,
-    next: Option<i32>,
-}
+use std::iter;
 
 /// Yields values moving outward from `origin` (clamped into the bounds), alternating
 /// above and below it in `step_size` increments and continuing on one side once the
@@ -17,13 +9,12 @@ pub struct OutFromOrigin {
 /// # Panics
 ///
 /// Panics if `lower_bound > upper_bound` or `step_size < 1`.
-#[must_use]
 pub fn out_from_origin(
     origin: i32,
     lower_bound: i32,
     upper_bound: i32,
     step_size: i32,
-) -> OutFromOrigin {
+) -> impl Iterator<Item = i32> {
     assert!(
         lower_bound <= upper_bound,
         "upper bound {upper_bound} must not be below lower bound {lower_bound}"
@@ -34,44 +25,23 @@ pub fn out_from_origin(
     );
 
     let origin = origin.clamp(lower_bound, upper_bound);
-    OutFromOrigin {
-        origin,
-        lower_bound,
-        upper_bound,
-        step_size,
-        next: Some(origin),
-    }
-}
-
-impl Iterator for OutFromOrigin {
-    type Item = i32;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let cursor = self.next?;
-        let distance = (self.origin - cursor).abs();
-        if self.origin - distance < self.lower_bound && self.origin + distance > self.upper_bound {
-            self.next = None;
-            return None;
-        }
-
-        let previous_was_negative = cursor <= self.origin;
-        let can_move_positive = self.origin + distance + self.step_size <= self.upper_bound;
-        let negative = self.origin
-            - distance
-            - if previous_was_negative {
-                self.step_size
-            } else {
-                0
-            };
+    iter::successors(Some(origin), move |&cursor| {
+        let distance = (origin - cursor).abs();
+        let previous_was_negative = cursor <= origin;
+        let can_move_positive = origin + distance + step_size <= upper_bound;
+        let negative = origin - distance - if previous_was_negative { step_size } else { 0 };
         let take_negative =
-            (!previous_was_negative || !can_move_positive) && negative >= self.lower_bound;
-        self.next = Some(if take_negative {
+            (!previous_was_negative || !can_move_positive) && negative >= lower_bound;
+        Some(if take_negative {
             negative
         } else {
-            self.origin + distance + self.step_size
-        });
-        Some(cursor)
-    }
+            origin + distance + step_size
+        })
+    })
+    .take_while(move |&cursor| {
+        let distance = (origin - cursor).abs();
+        origin - distance >= lower_bound || origin + distance <= upper_bound
+    })
 }
 
 #[cfg(test)]

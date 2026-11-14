@@ -18,4 +18,4 @@ pub use crate::angle::{
 };
 pub use crate::noise_math::*;
 pub use crate::rounding::round_f32;
-pub use crate::sequence::{OutFromOrigin, out_from_origin};
+pub use crate::sequence::out_from_origin;
