@@ -46,19 +46,30 @@ impl PoiSquareColumns {
     /// (x fastest, then z).
     #[must_use]
     pub fn capture(chunk_map: &Arc<ChunkMap>, center: BlockPos, radius: i32) -> Self {
-        let center_chunk = ChunkPos::from_block_pos(center);
+        let center = ChunkPos::from_block_pos(center);
         let chunk_radius = radius.div_euclid(16) + 1;
-        let side = (2 * chunk_radius + 1) as usize;
-        let mut columns = Vec::with_capacity(side * side);
-        for z in center_chunk.0.y - chunk_radius..=center_chunk.0.y + chunk_radius {
-            for x in center_chunk.0.x - chunk_radius..=center_chunk.0.x + chunk_radius {
-                let pos = ChunkPos::new(x, z);
-                let holder = chunk_map
-                    .current_holder(pos)
-                    .map(|holder| Arc::downgrade(&holder));
-                columns.push((pos, holder));
-            }
-        }
+        let rows = center.0.y - chunk_radius..=center.0.y + chunk_radius;
+        let positions = rows.flat_map(|z| {
+            (center.0.x - chunk_radius..=center.0.x + chunk_radius)
+                .map(move |x| ChunkPos::new(x, z))
+        });
+        Self::from_positions(chunk_map, positions)
+    }
+
+    /// Captures the chunks at `positions`, in order.
+    pub(crate) fn from_positions(
+        chunk_map: &Arc<ChunkMap>,
+        positions: impl IntoIterator<Item = ChunkPos>,
+    ) -> Self {
+        let columns = positions
+            .into_iter()
+            .map(|pos| {
+                (
+                    pos,
+                    chunk_map.current_holder(pos).as_ref().map(Arc::downgrade),
+                )
+            })
+            .collect();
         Self {
             columns,
             chunk_map: Arc::downgrade(chunk_map),
@@ -80,6 +91,28 @@ impl PoiSquareColumns {
         thread_pool: &ThreadPool,
         cancelled: &Arc<AtomicBool>,
     ) -> io::Result<Vec<SavedPoi>> {
+        Ok(self
+            .pois_by_chunk(storage, thread_pool, cancelled)
+            .await?
+            .into_iter()
+            .flat_map(|(chunk_pos, found)| {
+                // Like vanilla with a POI section it cannot read, log and skip it.
+                found.unwrap_or_else(|error| {
+                    tracing::warn!(chunk = ?chunk_pos, "Skipping unreadable saved chunk while reading POIs: {error}");
+                    Vec::new()
+                })
+            })
+            .collect())
+    }
+
+    /// [`Self::pois`] per captured chunk, in capture order, with a saved chunk that cannot be
+    /// read reported as its error rather than skipped.
+    pub async fn pois_by_chunk(
+        self,
+        storage: &ChunkStorage,
+        thread_pool: &ThreadPool,
+        cancelled: &Arc<AtomicBool>,
+    ) -> io::Result<Vec<(ChunkPos, io::Result<Vec<SavedPoi>>)>> {
         let (min_y, height) = (self.min_y, self.height);
         let (sender, receiver) = oneshot::channel();
         let scan_cancelled = Arc::clone(cancelled);
@@ -110,21 +143,22 @@ impl PoiSquareColumns {
             .filter(|(_, in_memory)| in_memory.is_none())
             .map(|&(pos, _)| pos)
             .collect();
-        let mut saved: FxHashMap<ChunkPos, Vec<SavedPoi>> = storage
+        let mut saved: FxHashMap<ChunkPos, io::Result<Vec<SavedPoi>>> = storage
             .saved_chunk_pois(&unloaded, min_y, height, thread_pool, cancelled)
             .await?
             .into_iter()
             .collect();
 
-        let mut found = Vec::new();
-        for (chunk_pos, in_memory) in scanned {
-            found.extend(
-                in_memory
+        Ok(scanned
+            .into_iter()
+            .map(|(chunk_pos, in_memory)| {
+                let found = in_memory
+                    .map(Ok)
                     .or_else(|| saved.remove(&chunk_pos))
-                    .unwrap_or_default(),
-            );
-        }
-        Ok(found)
+                    .unwrap_or_else(|| Ok(Vec::new()));
+                (chunk_pos, found)
+            })
+            .collect())
     }
 }
 

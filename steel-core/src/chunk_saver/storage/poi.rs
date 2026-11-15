@@ -38,8 +38,8 @@ impl ChunkStorage {
     /// Returns the POI blocks of saved chunks, by chunk, without loading the chunks.
     ///
     /// Types come from the saved block states, so this sees the same POIs vanilla's POI
-    /// sections hold for generated chunks. Missing chunks yield nothing; unreadable ones are
-    /// logged and skipped, as vanilla does with a POI section it cannot read.
+    /// sections hold for generated chunks. Missing chunks yield nothing; unreadable ones
+    /// yield their error.
     ///
     /// Decoding and scanning run on `thread_pool`, outside any storage lock. Once `cancelled`
     /// is set, the work stops at the next chunk and the call fails with
@@ -51,7 +51,7 @@ impl ChunkStorage {
         height: i32,
         thread_pool: &rayon::ThreadPool,
         cancelled: &Arc<AtomicBool>,
-    ) -> io::Result<Vec<(ChunkPos, Vec<SavedPoi>)>> {
+    ) -> io::Result<Vec<(ChunkPos, io::Result<Vec<SavedPoi>>)>> {
         let saved: Vec<(ChunkPos, SavedChunk)> = match self {
             Self::Disk(regions) => regions
                 .read_saved_chunks(positions, cancelled)
@@ -90,12 +90,7 @@ impl ChunkStorage {
                         Self::persistent_pois(&chunk.prepared.persistent, chunk_pos, min_y, height)
                     }
                 };
-                match found {
-                    Ok(found) => by_chunk.push((chunk_pos, found)),
-                    Err(error) => {
-                        tracing::warn!(chunk = ?chunk_pos, "Skipping unreadable saved chunk while reading POIs: {error}");
-                    }
-                }
+                by_chunk.push((chunk_pos, found));
             }
             let _ = sender.send(Ok(by_chunk));
         });
@@ -222,6 +217,18 @@ mod tests {
         test_support::{BlockedPool, fresh_test_world, insert_ready_full_chunk, one_thread_pool},
     };
 
+    use crate::chunk_saver::SavedPoi;
+
+    /// Unwraps each chunk's result; the tests here only save readable chunks.
+    fn readable(
+        by_chunk: Vec<(ChunkPos, io::Result<Vec<SavedPoi>>)>,
+    ) -> Vec<(ChunkPos, Vec<SavedPoi>)> {
+        by_chunk
+            .into_iter()
+            .map(|(pos, found)| (pos, found.expect("the saved chunk should be readable")))
+            .collect()
+    }
+
     #[test]
     fn ram_scan_runs_on_the_pool_without_holding_the_storage_lock() {
         steel_registry::init_vanilla_registry();
@@ -274,6 +281,7 @@ mod tests {
                     storage
                         .saved_chunk_pois(&[chunk_pos], min_y, height, &pool, &cancelled)
                         .await
+                        .map(readable)
                 }
             });
 
@@ -368,6 +376,7 @@ mod tests {
             ));
             disk.saved_chunk_pois(&[chunk_pos], min_y, height, &pool, &not_cancelled)
                 .await
+                .map(readable)
         });
         let _ = fs::remove_dir_all(&directory);
         let Ok(read) = read else {

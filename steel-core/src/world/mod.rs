@@ -103,7 +103,7 @@ use crate::{
         GameTime, GameTimeSource, LevelDataManager, RespawnData, WorldGenerationSettings,
     },
     player::{LastSeen, Player, connection::NetworkConnection},
-    poi::PointOfInterestStorage,
+    poi::{PointOfInterestStorage, SavedPoiLookups},
 };
 
 mod block_entity_ticker;
@@ -316,6 +316,8 @@ pub struct World {
         SyncMutex<Option<Arc<tick_scheduler::ScheduledTickRunBatch<FluidRef>>>>,
     /// Point of interest storage for efficient spatial queries of special blocks.
     pub poi_storage: SyncMutex<PointOfInterestStorage>,
+    /// POI lookups in chunks not loaded as Full.
+    pub(crate) saved_poi_lookups: SavedPoiLookups,
     /// World-change requests queued by world-local ticks for server safe-point processing.
     pending_world_changes: SyncMutex<Vec<(SharedEntity, WorldChangeRequest)>>,
 }
@@ -467,6 +469,7 @@ impl World {
                 scheduled_block_ticks_this_tick: SyncMutex::new(None),
                 scheduled_fluid_ticks_this_tick: SyncMutex::new(None),
                 poi_storage: SyncMutex::new(PointOfInterestStorage::new()),
+                saved_poi_lookups: SavedPoiLookups::default(),
                 pending_world_changes: SyncMutex::new(Vec::new()),
             }
         }))
