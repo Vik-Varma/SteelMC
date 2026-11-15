@@ -172,6 +172,24 @@ fn configured_chunk_encoding_threads(configured_threads: Option<usize>) -> Optio
     cap_positive_thread_count(configured_threads, available_worker_threads())
 }
 
+/// Builds the pool `/locate` searches run on.
+///
+/// A biome search that finds nothing samples about a million climate points, so searches stay
+/// off the shared chunk generation pool. Their jobs queue on one thread, as vanilla runs
+/// searches one at a time on the server thread.
+fn locate_search_pool() -> Result<ThreadPool, String> {
+    let mut builder = ThreadPoolBuilder::new()
+        .num_threads(1)
+        .thread_name(|_| "locate-search".to_owned());
+    // Biome sampling runs the deep density-function chains that need the larger debug stack.
+    if cfg!(debug_assertions) {
+        builder = builder.stack_size(DEBUG_STACK_SIZE);
+    }
+    builder
+        .build()
+        .map_err(|error| format!("failed to create locate search pool: {error}"))
+}
+
 fn cap_positive_thread_count(
     configured_threads: Option<usize>,
     available_threads: usize,
@@ -256,6 +274,7 @@ pub async fn test_server_with_worlds_and_config(
         command_requests: CommandRequestQueue::new(),
         packet_processor: PacketProcessor::new(),
         chunk_encoding_pool: Arc::new(chunk_encoding_pool),
+        locate_search_pool: Arc::new(locate_search_pool()?),
         jobs: ServerJobQueue::new(),
         player_data_storage,
         player_permission_states: SyncRwLock::new(player_permission_states),
@@ -502,6 +521,8 @@ pub struct Server {
     packet_processor: PacketProcessor,
     /// Dedicated worker pool for CPU-heavy chunk persistence and packet encoding.
     chunk_encoding_pool: Arc<ThreadPool>,
+    /// Worker pool for `/locate` searches.
+    pub(crate) locate_search_pool: Arc<ThreadPool>,
     /// Jobs resumed from a known point in the server game tick.
     pub jobs: ServerJobQueue,
     /// Player data storage for saving/loading player state.
@@ -839,6 +860,7 @@ impl Server {
             command_requests: CommandRequestQueue::new(),
             packet_processor: PacketProcessor::new(),
             chunk_encoding_pool,
+            locate_search_pool: Arc::new(locate_search_pool()?),
             jobs: ServerJobQueue::new(),
             player_data_storage,
             player_permission_states: SyncRwLock::new(player_permission_states),

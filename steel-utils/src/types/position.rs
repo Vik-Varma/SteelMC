@@ -446,6 +446,13 @@ impl BlockPos {
         DVec3::new(x, y, z).distance_squared(position) < distance * distance
     }
 
+    /// Squared distance to `other`, computed in doubles like vanilla's `Vec3i.distSqr`, so
+    /// distances across the whole world do not overflow.
+    #[must_use]
+    pub fn dist_sqr(&self, other: BlockPos) -> f64 {
+        self.0.as_dvec3().distance_squared(other.0.as_dvec3())
+    }
+
     /// Returns whether the squared integer distance to `other` is below `distance` squared.
     #[must_use]
     pub fn closer_than(&self, other: BlockPos, distance: f64) -> bool {

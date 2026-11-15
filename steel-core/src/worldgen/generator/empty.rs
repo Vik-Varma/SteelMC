@@ -1,12 +1,14 @@
 use crate::chunk::Chunk;
 use crate::worldgen::generator::{
-    ChunkGenerator, GenerationChunk, TerrainPhase, xoroshiro_worldgen_region_random,
+    ChunkGenerator, GenerationChunk, PLAINS_BIOME_SOURCE, TerrainPhase,
+    xoroshiro_worldgen_region_random,
 };
 use crate::worldgen::region::WorldGenRegion;
 use glam::IVec3;
 use steel_registry::{biome::BiomeRef, vanilla_biomes};
 use steel_utils::ChunkPos;
 use steel_utils::random::RandomSource;
+use steel_worldgen::biomes::BiomeSourceKind;
 use steel_worldgen::noise::Beardifier;
 
 /// A chunk generator that generates an empty world.
@@ -35,6 +37,10 @@ impl ChunkGenerator for EmptyChunkGenerator {
 
     fn noise_biome(&self, _quart_x: i32, _quart_y: i32, _quart_z: i32) -> BiomeRef {
         &vanilla_biomes::PLAINS
+    }
+
+    fn biome_source(&self) -> &BiomeSourceKind {
+        &PLAINS_BIOME_SOURCE
     }
 
     fn create_structures(&self, _chunk: &Chunk) {}

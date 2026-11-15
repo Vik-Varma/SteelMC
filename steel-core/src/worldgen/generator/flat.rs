@@ -9,10 +9,12 @@ use steel_utils::{BlockStateId, ChunkPos, Identifier};
 
 use crate::chunk::Chunk;
 use crate::worldgen::generator::{
-    ChunkGenerator, GenerationChunk, TerrainPhase, xoroshiro_worldgen_region_random,
+    ChunkGenerator, GenerationChunk, PLAINS_BIOME_SOURCE, TerrainPhase,
+    xoroshiro_worldgen_region_random,
 };
 use crate::worldgen::region::WorldGenRegion;
 use crate::worldgen::structure::{StructureGenerator, create_structures};
+use steel_worldgen::biomes::BiomeSourceKind;
 use steel_worldgen::noise::Beardifier;
 use steel_worldgen::structure::{ColumnBlock, StructureGenerationContext};
 
@@ -221,6 +223,10 @@ impl ChunkGenerator for FlatChunkGenerator {
 
     fn noise_biome(&self, _quart_x: i32, _quart_y: i32, _quart_z: i32) -> BiomeRef {
         &vanilla_biomes::PLAINS
+    }
+
+    fn biome_source(&self) -> &BiomeSourceKind {
+        &PLAINS_BIOME_SOURCE
     }
 
     fn spawn_height(&self, min_y: i32, height: i32) -> i32 {

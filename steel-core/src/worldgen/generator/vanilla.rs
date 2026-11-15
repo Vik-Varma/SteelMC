@@ -346,6 +346,10 @@ impl<N: VanillaPostNoiseStateType + NoiseSpawnTarget> ChunkGenerator for Vanilla
             .sample(quart_x, quart_y, quart_z)
     }
 
+    fn biome_source(&self) -> &BiomeSourceKind {
+        &self.biome_source
+    }
+
     fn initial_spawn_search_origin(&self) -> BlockPos {
         N::initial_spawn_search_origin(&self.biome_source, self.seed as u64)
     }

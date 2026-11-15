@@ -42,6 +42,24 @@ fn biome_or_tag_argument_resolves_registry_entries_and_tags() {
             .iter()
             .any(|suggestion| suggestion.text() == "#minecraft:is_overworld")
     );
+
+    // Like vanilla, tags are only offered for empty input or after `#`.
+    let suggested = |input: &str| {
+        let parse = dispatcher.parse(input, TestSource::new());
+        let Ok(suggestions) = dispatcher.completion_suggestions(&parse) else {
+            panic!("biome suggestions should build");
+        };
+        suggestions
+            .list()
+            .iter()
+            .map(|suggestion| suggestion.text().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let plain = suggested("resource is_");
+    assert!(plain.iter().all(|text| !text.starts_with('#')), "{plain:?}");
+    let empty = suggested("resource ");
+    assert!(empty.iter().any(|text| text == "#minecraft:is_overworld"));
+    assert!(empty.iter().any(|text| text == "minecraft:plains"));
 }
 
 #[test]
