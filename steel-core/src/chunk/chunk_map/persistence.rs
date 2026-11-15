@@ -193,6 +193,8 @@ impl ChunkMap {
 
             world.unregister_full_chunk_ticks(pos);
             world.on_entity_chunk_unload_finalized(pos);
+            // POIs outlive `begin_chunk_unload` so the unload save and a revival keep them.
+            world.poi_storage.lock().remove_chunk(pos);
             if has_chunk {
                 let map_clone = Arc::clone(self);
                 self.task_tracker.spawn_on(
