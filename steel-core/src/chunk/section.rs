@@ -14,7 +14,9 @@ use smallvec::SmallVec;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_registry::{REGISTRY, RegistryEntry};
 use steel_registry::{vanilla_biomes, vanilla_blocks};
-use steel_utils::{BlockPos, BlockStateId, ChunkPos, locks::SyncRwLock, serial::WriteTo};
+use steel_utils::{
+    BlockPos, BlockStateId, ChunkPos, SectionPos, locks::SyncRwLock, serial::WriteTo,
+};
 
 use crate::chunk::paletted_container::{BiomePalette, BlockPalette};
 use crate::physics::{
@@ -977,6 +979,15 @@ impl ChunkSection {
             // fall back to scanning rather than risk missing a POI.
             BlockPalette::Building(_) => true,
         }
+    }
+
+    /// Iterates this section's POI blocks with their POI type ids, in y, z, x order.
+    pub fn pois(&self, section_pos: SectionPos) -> impl Iterator<Item = (BlockPos, usize)> + '_ {
+        let poi = &REGISTRY.poi_types;
+        (0..BlockPalette::VOLUME).filter_map(move |index| {
+            let poi_type = poi.type_id_for_state(self.states.get_at_index(index))?;
+            Some((section_pos.block_at_index(index), poi_type))
+        })
     }
 
     /// Sets a block state and updates the cached counters.

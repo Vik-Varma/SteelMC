@@ -8,8 +8,10 @@ mod item;
 mod item_predicate;
 mod nbt;
 mod permission;
+mod poi_type;
 mod profile;
 mod queue;
+mod resource_or_tag;
 mod runtime;
 mod score;
 mod selector;
@@ -27,6 +29,7 @@ pub(crate) use block::{BlockInput, BlockPredicate, placement_flags};
 pub(crate) use coordinates::Coordinates;
 pub(crate) use item_predicate::ItemPredicate;
 pub(crate) use permission::PermissionGroupName;
+pub(crate) use poi_type::PoiTypeOrTag;
 pub(crate) use profile::GameProfileArgument;
 pub use queue::CommandSuspensionOrder;
 pub(crate) use queue::{

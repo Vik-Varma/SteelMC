@@ -11,7 +11,7 @@ use std::sync::Arc;
 use super::{
     BiomeOrTag, BlockInput, BlockPredicate, ChainModifiers, CommandResultSuspension, CommandSource,
     Coordinates, ExecutionCommandSource, ExecutionControl, GameProfileArgument, IntRange,
-    ItemPredicate, PermissionGroupName, ScoreHolderArgument, ScoreHolderWildcard,
+    ItemPredicate, PermissionGroupName, PoiTypeOrTag, ScoreHolderArgument, ScoreHolderWildcard,
     SteelArgumentType, StructureOrTagKey, WorldArgument,
     argument::{
         ComponentValue, CoordinateAxes, DomainValue, EnchantmentValue, EntityTypeValue,
@@ -284,6 +284,10 @@ where
     }
 
     pub(crate) fn biome_or_tag(&self, name: &str) -> Result<&BiomeOrTag, CommandSyntaxError> {
+        self.typed_argument(name)
+    }
+
+    pub(crate) fn poi_type_or_tag(&self, name: &str) -> Result<&PoiTypeOrTag, CommandSyntaxError> {
         self.typed_argument(name)
     }
 

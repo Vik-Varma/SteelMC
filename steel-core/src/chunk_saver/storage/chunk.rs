@@ -11,11 +11,11 @@ use super::{
 const PALETTE_INLINE_CAPACITY: usize = 8;
 
 impl ChunkStorage {
-    fn invalid_chunk_data(message: impl Into<String>) -> io::Error {
+    pub(super) fn invalid_chunk_data(message: impl Into<String>) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, message.into())
     }
 
-    fn validate_packed_palette(
+    pub(super) fn validate_packed_palette(
         palette: &[u16],
         bits_per_entry: u8,
         data: &[u64],
@@ -60,11 +60,8 @@ impl ChunkStorage {
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keeps complete chunk payload validation in one ordered pass"
-    )]
-    fn validate_persistent_chunk(
+    /// Checks the world range is section-aligned and the chunk has a section for each step.
+    pub(super) fn validate_section_layout(
         persistent: &PersistentChunk<'_>,
         min_y: i32,
         height: i32,
@@ -84,6 +81,20 @@ impl ChunkStorage {
                 persistent.sections.len()
             )));
         }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps complete chunk payload validation in one ordered pass"
+    )]
+    fn validate_persistent_chunk(
+        persistent: &PersistentChunk<'_>,
+        min_y: i32,
+        height: i32,
+    ) -> io::Result<()> {
+        Self::validate_section_layout(persistent, min_y, height)?;
+        let expected_sections = persistent.sections.len();
 
         for (section_index, section) in persistent.sections.iter().enumerate() {
             let biomes = match section {
