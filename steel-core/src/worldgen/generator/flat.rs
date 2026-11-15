@@ -16,6 +16,7 @@ use crate::worldgen::region::WorldGenRegion;
 use crate::worldgen::structure::{StructureGenerator, create_structures};
 use steel_worldgen::biomes::BiomeSourceKind;
 use steel_worldgen::noise::Beardifier;
+use steel_worldgen::structure::placement::StructurePlacement;
 use steel_worldgen::structure::{ColumnBlock, StructureGenerationContext};
 
 /// A chunk generator that generates a flat world.
@@ -212,6 +213,36 @@ impl StructureGenerationContext for FlatGenerationContext<'_> {
     }
 }
 
+impl FlatChunkGenerator {
+    fn structure_context<'a>(
+        &'a self,
+        structure_generator: &'a StructureGenerator,
+        chunk_pos: ChunkPos,
+        min_y: i32,
+        height: i32,
+    ) -> FlatGenerationContext<'a> {
+        let chunk_min_x = chunk_pos.0.x * 16;
+        let chunk_min_z = chunk_pos.0.y * 16;
+        FlatGenerationContext {
+            seed: self.seed,
+            chunk_x: chunk_pos.0.x,
+            chunk_z: chunk_pos.0.y,
+            chunk_min_x,
+            chunk_min_z,
+            center_block_x: chunk_min_x + 8,
+            center_block_z: chunk_min_z + 8,
+            sea_level: self.sea_level,
+            min_y,
+            height,
+            layers: &self.layers,
+            biome: &vanilla_biomes::PLAINS,
+            template_pools: structure_generator.template_pools(),
+            templates: structure_generator.templates(),
+            surface_y_cache: None,
+        }
+    }
+}
+
 impl ChunkGenerator for FlatChunkGenerator {
     fn min_y(&self) -> i32 {
         Self::MIN_Y
@@ -242,29 +273,28 @@ impl ChunkGenerator for FlatChunkGenerator {
             return;
         };
 
-        let pos = chunk.pos();
-        let chunk_x = pos.0.x;
-        let chunk_z = pos.0.y;
-        let chunk_min_x = chunk_x * 16;
-        let chunk_min_z = chunk_z * 16;
-        let mut ctx = FlatGenerationContext {
-            seed: self.seed,
-            chunk_x,
-            chunk_z,
-            chunk_min_x,
-            chunk_min_z,
-            center_block_x: chunk_min_x + 8,
-            center_block_z: chunk_min_z + 8,
-            sea_level: self.sea_level,
-            min_y: chunk.min_y(),
-            height: (chunk.sections().sections.len() * 16) as i32,
-            layers: &self.layers,
-            biome: &vanilla_biomes::PLAINS,
-            template_pools: structure_generator.template_pools(),
-            templates: structure_generator.templates(),
-            surface_y_cache: None,
-        };
+        let mut ctx = self.structure_context(
+            structure_generator,
+            chunk.pos(),
+            chunk.min_y(),
+            (chunk.sections().sections.len() * 16) as i32,
+        );
         create_structures(structure_generator, chunk, &mut ctx);
+    }
+
+    fn could_start_structure(
+        &self,
+        chunk_pos: ChunkPos,
+        min_y: i32,
+        height: i32,
+        placement: &StructurePlacement,
+        structure: &Identifier,
+    ) -> bool {
+        let Some(structure_generator) = &self.structure_generator else {
+            return false;
+        };
+        let mut ctx = self.structure_context(structure_generator, chunk_pos, min_y, height);
+        structure_generator.could_start_structure(&mut ctx, placement, structure)
     }
 
     fn create_biomes(&self, chunk: &Chunk) {

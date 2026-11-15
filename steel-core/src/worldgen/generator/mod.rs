@@ -26,8 +26,9 @@ use steel_utils::random::{
     PositionalRandom as _, Random as _, RandomSource, RandomSplitter, name_hash::NameHash,
     xoroshiro::Xoroshiro,
 };
-use steel_utils::{BlockPos, ChunkPos};
+use steel_utils::{BlockPos, ChunkPos, Identifier};
 use steel_worldgen::biomes::BiomeSourceKind;
+use steel_worldgen::structure::placement::StructurePlacement;
 
 use self::context::{ChunkGeneratorType, EndGenerator, NetherGenerator, OverworldGenerator};
 use crate::chunk::Chunk;
@@ -72,6 +73,19 @@ pub trait ChunkGenerator: Send + Sync {
 
     /// Creates the structures in a chunk.
     fn create_structures(&self, chunk: &Chunk);
+
+    /// [`StructureGenerator::could_start_structure`] for the placement chunk `chunk_pos`, with
+    /// `min_y` and `height` the world's build range. Generators that cannot tell answer `true`.
+    fn could_start_structure(
+        &self,
+        _chunk_pos: ChunkPos,
+        _min_y: i32,
+        _height: i32,
+        _placement: &StructurePlacement,
+        _structure: &Identifier,
+    ) -> bool {
+        true
+    }
 
     /// Creates the biomes in a chunk.
     fn create_biomes(&self, chunk: &Chunk);

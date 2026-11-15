@@ -7,7 +7,7 @@ use steel_utils::Identifier;
 use steel_worldgen::structure::StructureGenerationContext;
 
 pub use steel_worldgen::structure::{
-    StructureGenerator, StructureLocateCandidate, StructureLocatePlan, squared_distance,
+    StructureGenerator, StructureLocateCandidate, StructureLocatePlan,
 };
 
 /// Generates structure starts and writes them into the chunk.

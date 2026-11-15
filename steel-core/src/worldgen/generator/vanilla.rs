@@ -44,7 +44,8 @@ use steel_worldgen::noise::NoiseChunk;
 use steel_worldgen::noise::OreVeinifier;
 use steel_worldgen::noise::{Aquifer, AquiferResult, LazyAquifer, preliminary_surface_level};
 use steel_worldgen::noise::{CornerColumnStore, PreliminarySurfaceStore};
-use steel_worldgen::structure::GenerationContext;
+use steel_worldgen::structure::placement::StructurePlacement;
+use steel_worldgen::structure::{GenerationContext, StructureGenerationContext};
 use steel_worldgen::surface_partial::PartialSurfaceOutcome;
 
 const CARVER_SOURCE_CHUNK_COUNT: usize = 17 * 17;
@@ -331,38 +332,14 @@ impl<N: VanillaPostNoiseStateType> VanillaGenerator<N> {
     }
 }
 
-impl<N: VanillaPostNoiseStateType + NoiseSpawnTarget> ChunkGenerator for VanillaGenerator<N> {
-    fn min_y(&self) -> i32 {
-        N::Settings::MIN_Y
-    }
-
-    fn gen_depth(&self) -> i32 {
-        N::Settings::HEIGHT
-    }
-
-    fn noise_biome(&self, quart_x: i32, quart_y: i32, quart_z: i32) -> BiomeRef {
-        self.biome_source
-            .chunk_sampler()
-            .sample(quart_x, quart_y, quart_z)
-    }
-
-    fn biome_source(&self) -> &BiomeSourceKind {
-        &self.biome_source
-    }
-
-    fn initial_spawn_search_origin(&self) -> BlockPos {
-        N::initial_spawn_search_origin(&self.biome_source, self.seed as u64)
-    }
-
-    fn structure_generator(&self) -> Option<&StructureGenerator> {
-        Some(&self.structure_generator)
-    }
-
-    fn create_structures(&self, chunk: &Chunk) {
-        let pos = chunk.pos();
-        let chunk_x = pos.0.x;
-        let chunk_z = pos.0.y;
-
+impl<N: VanillaPostNoiseStateType + NoiseSpawnTarget> VanillaGenerator<N> {
+    /// Runs `f` with the structure generation context for chunk (`chunk_x`, `chunk_z`).
+    fn with_structure_context<R>(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        f: impl FnOnce(&mut dyn StructureGenerationContext) -> R,
+    ) -> R {
         let mut sampler = self.biome_source.chunk_sampler();
         let chunk_min_x = chunk_x * 16;
         let chunk_min_z = chunk_z * 16;
@@ -400,7 +377,56 @@ impl<N: VanillaPostNoiseStateType + NoiseSpawnTarget> ChunkGenerator for Vanilla
             &mut height_cache_grid_ready,
         );
 
-        create_structures(&self.structure_generator, chunk, &mut ctx);
+        f(&mut ctx)
+    }
+}
+
+impl<N: VanillaPostNoiseStateType + NoiseSpawnTarget> ChunkGenerator for VanillaGenerator<N> {
+    fn min_y(&self) -> i32 {
+        N::Settings::MIN_Y
+    }
+
+    fn gen_depth(&self) -> i32 {
+        N::Settings::HEIGHT
+    }
+
+    fn noise_biome(&self, quart_x: i32, quart_y: i32, quart_z: i32) -> BiomeRef {
+        self.biome_source
+            .chunk_sampler()
+            .sample(quart_x, quart_y, quart_z)
+    }
+
+    fn biome_source(&self) -> &BiomeSourceKind {
+        &self.biome_source
+    }
+
+    fn initial_spawn_search_origin(&self) -> BlockPos {
+        N::initial_spawn_search_origin(&self.biome_source, self.seed as u64)
+    }
+
+    fn structure_generator(&self) -> Option<&StructureGenerator> {
+        Some(&self.structure_generator)
+    }
+
+    fn create_structures(&self, chunk: &Chunk) {
+        let pos = chunk.pos();
+        self.with_structure_context(pos.0.x, pos.0.y, |ctx| {
+            create_structures(&self.structure_generator, chunk, ctx);
+        });
+    }
+
+    fn could_start_structure(
+        &self,
+        chunk_pos: ChunkPos,
+        _min_y: i32,
+        _height: i32,
+        placement: &StructurePlacement,
+        structure: &Identifier,
+    ) -> bool {
+        self.with_structure_context(chunk_pos.0.x, chunk_pos.0.y, |ctx| {
+            self.structure_generator
+                .could_start_structure(ctx, placement, structure)
+        })
     }
 
     fn create_biomes(&self, chunk: &Chunk) {

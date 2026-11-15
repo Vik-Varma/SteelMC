@@ -147,6 +147,7 @@ pub struct StructureGenerator {
     structure_sets: Vec<(Identifier, StructureSet)>,
     structure_set_indices: FxHashMap<Identifier, usize>,
     structure_data: FxHashMap<Identifier, StructureRef>,
+    possible_biomes: FxHashSet<Identifier>,
     ring_positions: FxHashMap<Identifier, Vec<ChunkPos>>,
     template_pools: FxHashMap<Identifier, TemplatePoolData>,
     templates: FxHashMap<Identifier, TemplateData>,
@@ -251,6 +252,17 @@ impl StructureLocatePlan {
         self.placements
             .get(candidate.scan_id)
             .map(|placement| placement.structures.as_slice())
+    }
+
+    /// The placement a candidate's scan belongs to.
+    #[must_use]
+    pub fn placement_for_candidate(
+        &self,
+        candidate: StructureLocateCandidate,
+    ) -> Option<&StructurePlacement> {
+        self.placements
+            .get(candidate.scan_id)
+            .map(|placement| &placement.placement)
     }
 
     /// Ring-placement candidates ordered by vanilla's stronghold distance pre-check.
@@ -372,6 +384,16 @@ pub fn squared_distance(a: BlockPos, b: BlockPos) -> i64 {
     let dy = i64::from(a.0.y) - i64::from(b.0.y);
     let dz = i64::from(a.0.z) - i64::from(b.0.z);
     dx * dx + dy * dy + dz * dz
+}
+
+/// Whether any of `structure`'s biomes can occur, which vanilla requires before placing or
+/// locating it. Steel also accepts a structure with no biome list.
+fn structure_can_occur(structure: StructureRef, possible_biomes: &FxHashSet<Identifier>) -> bool {
+    structure.allowed_biomes.is_empty()
+        || structure
+            .allowed_biomes
+            .iter()
+            .any(|biome| possible_biomes.contains(biome))
 }
 
 fn validate_structure_sets(structure_sets: &[(Identifier, StructureSet)]) {
@@ -667,13 +689,7 @@ impl StructureGenerator {
                 set.structures.iter().any(|entry| {
                     structure_data
                         .get(&entry.structure)
-                        .is_some_and(|structure| {
-                            structure.allowed_biomes.is_empty()
-                                || structure
-                                    .allowed_biomes
-                                    .iter()
-                                    .any(|biome| possible_biomes.contains(biome))
-                        })
+                        .is_some_and(|structure| structure_can_occur(structure, &possible_biomes))
                 })
             })
             .collect();
@@ -739,6 +755,7 @@ impl StructureGenerator {
             structure_sets,
             structure_set_indices,
             structure_data,
+            possible_biomes,
             ring_positions,
             template_pools: assets.template_pools,
             templates: assets.templates,
@@ -759,6 +776,10 @@ impl StructureGenerator {
     }
 
     /// Builds a detached locate plan for one or more structure ids.
+    ///
+    /// Like vanilla's `ChunkGeneratorStructureState.getPlacementsForStructure`, a structure
+    /// none of whose biomes can occur in this dimension is left out, even when another
+    /// structure in its set can occur.
     #[must_use]
     pub fn locate_plan_for_structures(
         &self,
@@ -772,6 +793,10 @@ impl StructureGenerator {
                     set.structures
                         .iter()
                         .any(|entry| entry.structure == **structure)
+                        && self
+                            .structure_data
+                            .get(*structure)
+                            .is_some_and(|data| structure_can_occur(data, &self.possible_biomes))
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -790,6 +815,23 @@ impl StructureGenerator {
             seed: self.seed,
             placements,
         })
+    }
+
+    /// Vanilla's `StructureCheck` test for a chunk that is not loaded: whether `structure`
+    /// could start in the context's chunk under `placement`, without generating the chunk.
+    ///
+    /// The chunk must be a placement chunk of `placement`. This applies the placement's
+    /// frequency, then the structure's own generation-point search, which also checks its
+    /// biomes. Like vanilla it ignores exclusion zones and which structure of the set the
+    /// chunk would pick, so `true` means the chunk must be generated to know.
+    pub fn could_start_structure(
+        &self,
+        ctx: &mut dyn StructureGenerationContext,
+        placement: &StructurePlacement,
+        structure: &Identifier,
+    ) -> bool {
+        placement.applies_additional_chunk_restrictions(self.seed, ctx.chunk_x(), ctx.chunk_z())
+            && self.try_generate_structure(structure, ctx).is_some()
     }
 
     /// Generates structure starts for one chunk.
@@ -899,7 +941,7 @@ impl StructureGenerator {
         ctx: &mut dyn StructureGenerationContext,
     ) -> Option<(StructureRef, GenerationStub)> {
         if set.structures.len() == 1 {
-            return self.try_generate_entry(&set.structures[0], ctx);
+            return self.try_generate_structure(&set.structures[0].structure, ctx);
         }
 
         let mut rng = LegacyRandom::from_seed(0);
@@ -920,7 +962,7 @@ impl StructureGenerator {
             }
 
             let candidate = remaining[selected_idx];
-            if let Some(generated) = self.try_generate_entry(candidate, ctx) {
+            if let Some(generated) = self.try_generate_structure(&candidate.structure, ctx) {
                 return Some(generated);
             }
 
@@ -931,13 +973,13 @@ impl StructureGenerator {
         None
     }
 
-    fn try_generate_entry(
+    fn try_generate_structure(
         &self,
-        entry: &StructureSelectionEntry,
+        structure_key: &Identifier,
         ctx: &mut dyn StructureGenerationContext,
     ) -> Option<(StructureRef, GenerationStub)> {
-        let Some(structure) = self.structure_data.get(&entry.structure).copied() else {
-            tracing::warn!("Missing structure registry data for {}", entry.structure);
+        let Some(structure) = self.structure_data.get(structure_key).copied() else {
+            tracing::warn!("Missing structure registry data for {structure_key}");
             return None;
         };
 
@@ -989,6 +1031,7 @@ mod tests {
     use std::{
         env::temp_dir,
         path::PathBuf,
+        slice,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1063,11 +1106,28 @@ mod tests {
             structure_sets: sets,
             structure_set_indices,
             structure_data: FxHashMap::default(),
+            possible_biomes: FxHashSet::default(),
             ring_positions: FxHashMap::default(),
             template_pools: FxHashMap::default(),
             templates: FxHashMap::default(),
             structure_impls: FxHashMap::default(),
         }
+    }
+
+    /// Gives `generator` the registry's structures and makes `possible_biomes` the biomes
+    /// that can occur.
+    fn with_vanilla_structures(
+        mut generator: StructureGenerator,
+        possible_biomes: &[Identifier],
+    ) -> StructureGenerator {
+        init_vanilla_registry();
+        generator.structure_data = REGISTRY
+            .structures
+            .iter()
+            .map(|(_, structure)| (structure.key.clone(), structure))
+            .collect();
+        generator.possible_biomes = possible_biomes.iter().cloned().collect();
+        generator
     }
 
     fn temp_world_dir(test_name: &str) -> PathBuf {
@@ -1359,9 +1419,9 @@ mod tests {
 
     #[test]
     fn locate_candidates_retain_only_structures_for_their_placement_scan() {
-        let first_structure = Identifier::new("test", "first");
-        let second_structure = Identifier::new("test", "second");
-        let third_structure = Identifier::new("test", "third");
+        let first_structure = Identifier::vanilla_static("village_plains");
+        let second_structure = Identifier::vanilla_static("desert_pyramid");
+        let third_structure = Identifier::vanilla_static("village_desert");
         let mut first_set = test_structure_set(every_chunk_placement(None));
         first_set.structures[0].structure = first_structure.clone();
         first_set.structures.push(StructureSelectionEntry {
@@ -1372,10 +1432,16 @@ mod tests {
         second_placement.salt = 1;
         let mut second_set = test_structure_set(second_placement);
         second_set.structures[0].structure = second_structure.clone();
-        let generator = generator_with_sets(vec![
-            (Identifier::new("test", "first_set"), first_set),
-            (Identifier::new("test", "second_set"), second_set),
-        ]);
+        let generator = with_vanilla_structures(
+            generator_with_sets(vec![
+                (Identifier::new("test", "first_set"), first_set),
+                (Identifier::new("test", "second_set"), second_set),
+            ]),
+            &[
+                vanilla_biomes::PLAINS.key.clone(),
+                vanilla_biomes::DESERT.key.clone(),
+            ],
+        );
         let Some(plan) = generator.locate_plan_for_structures(&[
             third_structure.clone(),
             first_structure.clone(),
@@ -1393,6 +1459,39 @@ mod tests {
         assert_eq!(
             plan.structures_for_candidate(candidates[1]),
             Some([second_structure].as_slice())
+        );
+    }
+
+    #[test]
+    fn locate_leaves_out_structures_whose_biomes_cannot_occur() {
+        let plains_village = Identifier::vanilla_static("village_plains");
+        let desert_village = Identifier::vanilla_static("village_desert");
+        let mut villages = test_structure_set(every_chunk_placement(None));
+        villages.structures[0].structure = plains_village.clone();
+        villages.structures.push(StructureSelectionEntry {
+            structure: desert_village.clone(),
+            weight: 1,
+        });
+        let generator = with_vanilla_structures(
+            generator_with_sets(vec![(Identifier::new("test", "villages"), villages)]),
+            slice::from_ref(&vanilla_biomes::PLAINS.key),
+        );
+
+        // The set stays, since a plains village can occur, but a desert village cannot.
+        assert!(
+            generator
+                .locate_plan_for_structures(slice::from_ref(&desert_village))
+                .is_none()
+        );
+        let Some(plan) =
+            generator.locate_plan_for_structures(&[desert_village, plains_village.clone()])
+        else {
+            panic!("a plains village can occur");
+        };
+        let candidates = plan.random_spread_candidates_at_radius(BlockPos::new(0, 64, 0), 0);
+        assert_eq!(
+            plan.structures_for_candidate(candidates[0]),
+            Some([plains_village].as_slice())
         );
     }
 

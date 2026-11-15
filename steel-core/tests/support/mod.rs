@@ -39,8 +39,12 @@ use crate::world::game_event::GameEventContext;
 use crate::world::{
     LevelAccessor, LevelReader, ScheduledTickAccess, World, WorldConfig, WorldStorageConfig,
 };
-use crate::worldgen::{ChunkGeneratorType, EmptyChunkGenerator};
+use crate::worldgen::structure::StructureGenerator;
+use crate::worldgen::{ChunkGeneratorType, EmptyChunkGenerator, FlatChunkGenerator};
+use steel_registry::{REGISTRY, vanilla_biomes};
 use steel_utils::ChunkPos;
+use steel_worldgen::biomes::BiomeSourceKind;
+use steel_worldgen::structure::placement::load_vanilla_structure_sets;
 
 mod connection;
 mod player;
@@ -329,8 +333,76 @@ pub(crate) fn create_test_world_with_damage_history(
     history: &Arc<DamageHistory>,
 ) -> Arc<World> {
     init_vanilla_registry();
+    create_test_world_with_generator(
+        key,
+        difficulty,
+        dimension_type,
+        game_time_source,
+        history,
+        ChunkGeneratorType::Empty(EmptyChunkGenerator::new()),
+    )
+}
+
+/// A fresh overworld whose generator is flat grass with the given vanilla structure sets, as
+/// a superflat world with structure overrides.
+pub(crate) fn fresh_flat_world_with_structure_sets(
+    key: &'static str,
+    seed: i64,
+    structure_sets: &[&'static str],
+) -> TestWorld {
+    init_vanilla_registry();
+    let structure_sets = load_vanilla_structure_sets()
+        .into_iter()
+        .filter(|(set_key, _)| {
+            structure_sets
+                .iter()
+                .any(|wanted| *set_key == Identifier::vanilla_static(wanted))
+        })
+        .collect();
+    let structure_generator = StructureGenerator::vanilla_flat_with_structure_sets(
+        seed,
+        None,
+        &BiomeSourceKind::fixed(&vanilla_biomes::PLAINS),
+        structure_sets,
+        &test_world_resources().generation_pool,
+    );
+    let layers = [
+        &vanilla_blocks::BEDROCK,
+        &vanilla_blocks::DIRT,
+        &vanilla_blocks::DIRT,
+        &vanilla_blocks::GRASS_BLOCK,
+    ]
+    .into_iter()
+    .map(|block| REGISTRY.blocks.get_default_state_id(block))
+    .collect();
+    let generator = ChunkGeneratorType::Flat(FlatChunkGenerator::new_layers_with_structures(
+        layers,
+        seed,
+        FlatChunkGenerator::SEA_LEVEL,
+        Some(structure_generator),
+    ));
+    let history = Arc::new(DamageHistory::default());
+    let world = create_test_world_with_generator(
+        Identifier::vanilla_static(key),
+        Difficulty::Normal,
+        &vanilla_dimension_types::OVERWORLD,
+        GameTimeSource::Primary,
+        &history,
+        generator,
+    );
+    TestWorld { world, history }
+}
+
+fn create_test_world_with_generator(
+    key: Identifier,
+    difficulty: Difficulty,
+    dimension_type: DimensionTypeRef,
+    game_time_source: GameTimeSource,
+    history: &Arc<DamageHistory>,
+    generator: ChunkGeneratorType,
+) -> Arc<World> {
     let resources = test_world_resources();
-    let generator = Arc::new(ChunkGeneratorType::Empty(EmptyChunkGenerator::new()));
+    let generator = Arc::new(generator);
     let generator_config = toml::Value::Table(Map::new());
     let generation_settings = WorldGenerationSettings::from_generator_config(
         Identifier::vanilla_static("empty"),
