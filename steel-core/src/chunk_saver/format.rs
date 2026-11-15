@@ -145,6 +145,12 @@ impl ChunkEntry {
         }
     }
 
+    /// The sectors this chunk occupies, as `(start, end)` with `end` exclusive.
+    #[must_use]
+    pub const fn sector_range(&self) -> (u32, u32) {
+        (self.sector_offset, self.sector_offset + self.sector_count())
+    }
+
     /// Calculates the number of sectors this chunk occupies.
     #[must_use]
     pub const fn sector_count(&self) -> u32 {
@@ -259,11 +265,12 @@ impl RegionHeader {
         Ok(Self { entries })
     }
 
-    /// Finds a contiguous range of free sectors for allocation.
+    /// Finds the first contiguous run of `sectors_needed` sectors that no entry uses and no
+    /// `reserved` range (`(start, end)`, end exclusive) overlaps.
     ///
-    /// Returns the starting sector offset, or `None` if no suitable range exists.
+    /// Sectors past the last used one are free even if the file already extends over them.
     #[must_use]
-    pub fn find_free_sectors(&self, sectors_needed: u32, file_sectors: u32) -> u32 {
+    pub fn find_free_sectors(&self, sectors_needed: u32, reserved: &[(u32, u32)]) -> u32 {
         if sectors_needed == 0 {
             return FIRST_DATA_SECTOR;
         }
@@ -273,7 +280,8 @@ impl RegionHeader {
             .entries
             .iter()
             .filter(|e| e.exists())
-            .map(|e| (e.sector_offset, e.sector_offset + e.sector_count()))
+            .map(ChunkEntry::sector_range)
+            .chain(reserved.iter().copied())
             .collect();
         used_ranges.sort_by_key(|r| r.0);
 
@@ -287,8 +295,8 @@ impl RegionHeader {
             current_sector = current_sector.max(end);
         }
 
-        // No gap found, append at the end
-        current_sector.max(file_sectors)
+        // No gap found, so use the space after the last used sector.
+        current_sector
     }
 }
 
@@ -1297,7 +1305,7 @@ mod tests {
     fn test_find_free_sectors_empty() {
         let header = RegionHeader::new();
         // Should return first data sector
-        assert_eq!(header.find_free_sectors(1, 3), FIRST_DATA_SECTOR);
+        assert_eq!(header.find_free_sectors(1, &[]), FIRST_DATA_SECTOR);
     }
 
     #[test]
@@ -1309,8 +1317,14 @@ mod tests {
         header.entries[1] = ChunkEntry::new(10, 8000, ChunkStatus::Full);
 
         // Should find gap at sector 5-9
-        assert_eq!(header.find_free_sectors(3, 12), 5);
-        // Needs more than gap, append at end
-        assert_eq!(header.find_free_sectors(6, 12), 12);
+        assert_eq!(header.find_free_sectors(3, &[]), 5);
+        // Needs more than gap, so goes after the last used sector
+        assert_eq!(header.find_free_sectors(6, &[]), 12);
+        // A reserved range splits the gap
+        assert_eq!(header.find_free_sectors(3, &[(6, 8)]), 12);
+        assert_eq!(header.find_free_sectors(3, &[(6, 7)]), 7);
+        assert_eq!(header.find_free_sectors(1, &[(5, 6)]), 6);
+        // Reserved space past the last entry is skipped too
+        assert_eq!(header.find_free_sectors(6, &[(12, 14)]), 14);
     }
 }
