@@ -345,15 +345,43 @@ fn gameplay_cache_scopes_observe_a_full_holder_revived_between_phases() {
 
 /// Registers a claimed `home` POI so the test can tell persisted ticket state from a rescan.
 fn add_claimed_home_poi(world: &World, pos: BlockPos) {
+    add_home_poi(world, pos);
+    assert!(
+        world.poi_storage.lock().reserve_ticket(pos),
+        "a fresh home POI has one free ticket"
+    );
+}
+
+fn add_home_poi(world: &World, pos: BlockPos) {
     let home = vanilla_poi_types::HOME
         .try_id()
         .expect("vanilla home POI type should be registered");
-    let mut storage = world.poi_storage.lock();
-    storage.add(pos, home, 1);
-    assert!(
-        storage.reserve_ticket(pos),
-        "a fresh home POI has one free ticket"
-    );
+    world.poi_storage.lock().add(pos, home, 1);
+}
+
+#[test]
+fn a_poi_ticket_claimed_while_its_chunk_unloads_is_saved() {
+    init_vanilla_registry();
+    init_behaviors();
+    let world_fixture = fresh_test_world("poi_ticket_while_unloading");
+    let world = &world_fixture.world;
+    let chunk_pos = ChunkPos::new(0, 0);
+    let poi_pos = BlockPos::new(1, 64, 1);
+    let holder = insert_ready_full_chunk(world, chunk_pos);
+    add_home_poi(world, poi_pos);
+
+    world.chunk_map.update_chunk_level(chunk_pos, None);
+    assert!(world.chunk_map.unloading_chunks.contains_sync(&chunk_pos));
+    let Some(chunk) = holder.try_chunk(ChunkStatus::Full) else {
+        panic!("unloading test chunk must remain Full");
+    };
+    chunk.clear_dirty();
+
+    // The POI is still in storage, so the claim succeeds and must keep the chunk from being
+    // dropped unsaved.
+    assert!(world.reserve_poi_ticket(poi_pos));
+    assert!(chunk.is_dirty());
+    stop_chunk_tasks(world);
 }
 
 #[test]
